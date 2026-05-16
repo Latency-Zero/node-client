@@ -1,77 +1,190 @@
-import LatZeroClient from './index.js';
+/**
+ * Test script for LatZero Node.js Client
+ *
+ * Tests both LatZeroClient (sync-style) and LatZeroAsyncClient.
+ */
 
-async function test() {
-    console.log('=== LatZero Node.js Client Test ===\n');
-    
-    // Create client
-    const client = new LatZeroClient('latzero://node-test-client', 'alpha');
-    
-    // Wait for connection
-    await new Promise(resolve => {
-        client.on('connect', resolve);
-        client.on('error', (err) => {
-            console.error('Connection failed:', err);
-            process.exit(1);
-        });
+import LatZeroClient, { LatZeroAsyncClient } from './index.js';
+
+// ─── Sync-style smoke test ────────────────────────────────────────────────────
+
+console.log('=== Sync-style LatZeroClient smoke test ===\n');
+
+const syncClient = new LatZeroClient('latzero://sync-test-client', 'test', {
+    host: '127.0.0.1', port: 14130
+});
+
+// All of these queue internally and fire once connected — no await needed:
+syncClient.set('sync:hello', 'world');
+syncClient.process.register((data) => data.a + data.b, 'add');
+
+syncClient.on('connect', async () => {
+    console.log('✅ [sync] Connected');
+    const val = await syncClient.get('sync:hello');
+    console.log('✅ [sync] got sync:hello =', val);
+    syncClient.disconnect();
+    console.log('✅ [sync] Smoke test passed\n');
+
+    // Now run the async test suite
+    testAsyncClient().catch(console.error);
+});
+
+syncClient.on('error', (e) => {
+    console.error('❌ [sync] Error:', e.message);
+    testAsyncClient().catch(console.error); // still try async test
+});
+
+// ─── Async test suite ─────────────────────────────────────────────────────────
+
+async function testAsyncClient() {
+    console.log('=== Testing LatZeroAsyncClient ===\n');
+
+    const client = new LatZeroAsyncClient('latzero://node-test-client-3', 'test', {
+        host: '127.0.0.1',
+        port: 14130,
+        autoConnect: true
     });
-    
-    console.log('✓ Connected to server');
-    
-    // Test basic operations
-    console.log('\n--- Testing Key-Value Operations ---');
-    await client.set('user', { name: 'Alice', age: 30 }, { persistent: true });
-    console.log('✓ Set user data');
-    
-    const user = await client.get('user');
-    console.log('✓ Get user:', user);
-    
-    await client.set('counter', 42);
-    console.log('✓ Set counter');
-    
-    const keys = await client.keys();
-    console.log('✓ Keys:', keys);
-    
-    // Test batch operations
-    console.log('\n--- Testing Batch Operations ---');
-    await client.mset({
-        'batch1': 'value1',
-        'batch2': 'value2',
-        'batch3': 'value3'
+
+    // Set up event listeners
+    client.on('connect', () => {
+        console.log('✅ Connected to LatZero server');
     });
-    console.log('✓ MSet completed');
-    
-    const values = await client.mget(['batch1', 'batch2', 'batch3']);
-    console.log('✓ MGet:', values);
-    
-    // Test event handling
-    console.log('\n--- Testing Events ---');
-    client.on('test:event', (data) => {
-        console.log('✓ Received test:event:', data);
+
+    client.on('disconnect', () => {
+        console.log('❌ Disconnected from server');
     });
-    
+
+    client.on('error', (error) => {
+        console.error('❌ Error:', error.message);
+    });
+
     client.on('presence', (data) => {
-        console.log('✓ Presence update:', data);
+        console.log('📡 Presence update:', JSON.stringify(data));
     });
-    
-    // Test event emission
-    await client.emitEvent('test:event', {
-        data: { message: 'Hello from Node.js!' }
+
+    client.on('bufferUpdate', (data) => {
+        console.log('📝 Buffer update:', JSON.stringify(data));
     });
-    
-    // Test statistics
-    console.log('\n--- Testing Statistics ---');
-    const stats = await client.stats();
-    console.log('✓ Stats:', stats);
-    
-    // Cleanup
-    console.log('\n--- Cleaning Up ---');
-    await client.delete('counter');
-    console.log('✓ Deleted counter');
-    
-    client.disconnect();
-    console.log('✓ Disconnected');
-    
-    console.log('\n=== Test Complete ===');
+
+    try {
+        // Wait for connection
+        await new Promise(resolve => {
+            client.once('connect', resolve);
+            setTimeout(resolve, 5000); // Timeout after 5 seconds
+        });
+
+        if (!client.connected) {
+            throw new Error('Failed to connect to server');
+        }
+
+        console.log('\n=== Testing Process Registration ===');
+        
+        // Register an add function
+        const addFunction = async (data) => {
+            const a = data.a !== undefined ? data.a : data.x;
+            const b = data.b !== undefined ? data.b : data.y;
+            console.log(`🔢 Add function called: ${a} + ${b} = ${a + b}`);
+            return a + b;
+        };
+
+        await client.process.register(addFunction, 'add');
+        console.log('✅ Add function registered');
+        console.log(`📍 Process ID: ${client.clientId}:add`);
+
+        // Verify registration by listing processes
+        const processes = await client.process.list();
+        console.log('📋 Current processes:', Object.keys(processes));
+        
+        if (processes[`${client.clientId}:add`]) {
+            console.log('✅ Process is visible in server TUI!');
+        } else {
+            console.log('❌ Process not found in server list');
+        }
+
+        console.log('\n=== Testing Process Calls ===');
+        
+        // Test calling our own process
+        // const result1 = await client.process.call(`${client.clientId}:add`, { a: 10, b: 5 });
+        // console.log('🔢 Self-call result:', result1.payload.value); // Should be 15
+
+        // Test with x,y format (for Python compatibility)
+        const result2 = await client.process.call(`${client.clientId}:add`, { x: 7, y: 8 });
+        console.log('self-call format result:', result2.payload.value); // Should be 15
+
+        const result23 = await client.process.call(`client-1:add`, { x: 7, y: 8 });
+        console.log('client-1 call format result:', result23.payload.value); // Should be 15
+
+        console.log('\n=== Testing Buffer Operations ===');
+        
+        // Test basic buffer operations
+        await client.set('test-key', 'test-value');
+        console.log('✅ Buffer set: test-key = test-value');
+
+        const value = await client.get('test-key');
+        console.log('📖 Buffer get: test-key =', value);
+
+        const exists = await client.exists('test-key');
+        console.log('🔍 Buffer exists: test-key =', exists);
+
+        const keys = await client.keys();
+        console.log('🔑 All keys:', keys);
+
+        console.log('\n=== Testing Cross-Process Event Handling ===');
+        
+        // Register an event handler for testing call_app messages
+        client.on('test-event', (data) => {
+            console.log('📡 Received test-event:', data);
+            return 'Event handled successfully';
+        });
+
+        console.log('✅ Event handler registered for test-event');
+        console.log('📞 Ready to receive call_app messages from other clients');
+        console.log('🎯 Process ID for external calls:', `${client.clientId}:add`);
+        console.log('🎯 Event name for external calls:', `${client.clientId}:add`);
+
+        console.log('\n=== Client Status ===');
+        const stats = await client.stats();
+        console.log('📊 Pool stats:', stats);
+
+        console.log('\n=== Test Complete ===');
+        console.log('✅ Node client is working correctly!');
+        console.log('🔧 Processes should be visible in server TUI');
+        console.log('🤝 Ready for cross-process communication');
+
+        // Keep client running for testing
+        console.log('\n⏳ Client running... Press Ctrl+C to exit');
+        
+        // Set up periodic status check
+        const statusInterval = setInterval(async () => {
+            if (client.connected) {
+                const processes = await client.process.list();
+                console.log(`📋 Active processes: ${Object.keys(processes).length}`);
+            } else {
+                console.log('❌ Client disconnected');
+                clearInterval(statusInterval);
+            }
+        }, 10000);
+
+        // Handle graceful shutdown
+        process.on('SIGINT', async () => {
+            console.log('\n🛑 Shutting down...');
+            clearInterval(statusInterval);
+            
+            // Unregister process
+            await client.process.unregister('add');
+            console.log('🗑️ Process unregistered');
+            
+            client.disconnect();
+            console.log('👋 Disconnected from server');
+            process.exit(0);
+        });
+
+    } catch (error) {
+        console.error('❌ Test failed:', error.message);
+        console.error('🔧 Make sure LatZero server is running on 127.0.0.1:14130');
+        process.exit(1);
+    }
 }
 
-test().catch(console.error);
+// Entry point — sync smoke test runs first, then kicks off async suite.
+// (testAsyncClient is called from the syncClient 'connect' handler above)

@@ -1,7 +1,7 @@
 {
-  "name": "latzero-node-client",
-  "version": "1.0.0",
-  "description": "Node.js client for LatZero server mode",
+  "name": "latzero",
+  "version": "1.1.0",
+  "description": "Node.js client for LatZero",
   "main": "index.js",
   "type": "module",
   "scripts": {
