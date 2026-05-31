@@ -1,17 +1,10 @@
 /**
- * LatZero Node.js Client
- *
- * Exports:
- *   - LatZeroClient       (default) — sync-style, auto-queuing, no await needed for writes
- *   - LatZeroAsyncClient  (named)   — explicit async/await API
+ * LatZero Node.js Client — CommonJS entry
  */
+'use strict';
 
-import net from 'net';
-import { EventEmitter } from 'events';
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal base — shared TCP logic, message routing, event handling
-// ─────────────────────────────────────────────────────────────────────────────
+const net = require('net');
+const { EventEmitter } = require('events');
 
 class LatZeroBaseClient extends EventEmitter {
     constructor(dsn, pool, options = {}) {
@@ -30,13 +23,11 @@ class LatZeroBaseClient extends EventEmitter {
 
         this.socket        = null;
         this.connected     = false;
-        this.pending       = new Map();  // requestId → {resolve, reject, requestType}
-        this.eventHandlers = new Map();  // event/compound-key → [handlers]
+        this.pending       = new Map();
+        this.eventHandlers = new Map();
         this.messageBuffer = '';
-        this._processes    = new Map();  // short name → fn
+        this._processes    = new Map();
     }
-
-    // ── Socket ────────────────────────────────────────────────────────────────
 
     _connectSocket() {
         return new Promise((resolve, reject) => {
@@ -83,13 +74,10 @@ class LatZeroBaseClient extends EventEmitter {
         });
     }
 
-    // ── Message routing ───────────────────────────────────────────────────────
-
     handleMessage(msg) {
         const { type, request_id, payload } = msg;
         if (request_id && this.pending.has(request_id)) {
             const entry = this.pending.get(request_id);
-            // Ignore ack for blocking calls — they wait for app_result
             if (type === 'ack' && (entry.requestType === 'call_process' || entry.requestType === 'call_app')) return;
             if (type === 'ack' || type === 'error' || type === 'app_result') {
                 this.pending.delete(request_id);
@@ -154,8 +142,6 @@ class LatZeroBaseClient extends EventEmitter {
         catch (e) { reply(null, { type: e.constructor.name, message: e.message }); }
     }
 
-    // ── Transport ─────────────────────────────────────────────────────────────
-
     sendMessage(msg) {
         if (!this.connected || !this.socket) throw new Error('Not connected to server');
         this.socket.write(JSON.stringify(msg) + '\n');
@@ -195,8 +181,6 @@ class LatZeroBaseClient extends EventEmitter {
         catch { throw new TypeError('Only JSON-serializable values are supported'); }
     }
 
-    // ── Event handler registry (separate from EventEmitter internals) ─────────
-
     on(event, handler) {
         if (!this.eventHandlers.has(event)) this.eventHandlers.set(event, []);
         this.eventHandlers.get(event).push(handler);
@@ -219,19 +203,11 @@ class LatZeroBaseClient extends EventEmitter {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// LatZeroClient — sync-style default export
-//
-// All ops queue automatically before the connection is established.
-// Writes are fire-and-forget (return Promises you can ignore).
-// Reads return Promises you can .then() or await.
-// ─────────────────────────────────────────────────────────────────────────────
-
 class LatZeroClient extends LatZeroBaseClient {
     constructor(dsn, pool, options = {}) {
         super(dsn, pool, options);
 
-        this._opQueue   = [];   // pending ops while not yet connected
+        this._opQueue   = [];
         this._ready     = false;
         this._connecting = false;
 
@@ -239,8 +215,6 @@ class LatZeroClient extends LatZeroBaseClient {
 
         if (options.autoConnect !== false) this._startConnect();
     }
-
-    // ── Queue engine ──────────────────────────────────────────────────────────
 
     _startConnect() {
         if (this._connecting || this._ready) return;
@@ -258,20 +232,16 @@ class LatZeroClient extends LatZeroBaseClient {
             });
     }
 
-    /** Run fn immediately if connected, otherwise queue it. */
     _enqueue(fn) {
         if (this._ready) fn();
         else this._opQueue.push(fn);
     }
 
-    /** Wrap sendRequest so it is deferred until connected. */
     _q(type, payload, pool = null) {
         return new Promise((resolve, reject) => {
             this._enqueue(() => this.sendRequest(type, payload, pool).then(resolve).catch(reject));
         });
     }
-
-    // ── connect() ─ optional callback or Promise ──────────────────────────────
 
     connect(callback) {
         if (callback) {
@@ -288,8 +258,6 @@ class LatZeroClient extends LatZeroBaseClient {
             this.once('error', reject);
         });
     }
-
-    // ── process.* proxy ───────────────────────────────────────────────────────
 
     _makeProcessProxy() {
         const s = this;
@@ -352,8 +320,6 @@ class LatZeroClient extends LatZeroBaseClient {
             }
         };
     }
-
-    // ── Buffer ops ────────────────────────────────────────────────────────────
 
     set(key, value, options = {}) {
         this.ensureJsonable(value);
@@ -461,10 +427,6 @@ class LatZeroClient extends LatZeroBaseClient {
         }).then(() => { this.poolName = pool; this.authToken = authToken; });
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// LatZeroAsyncClient — explicit async/await API (named export)
-// ─────────────────────────────────────────────────────────────────────────────
 
 class LatZeroAsyncClient extends LatZeroBaseClient {
     constructor(dsn, pool, options = {}) {
@@ -639,5 +601,5 @@ class LatZeroAsyncClient extends LatZeroBaseClient {
     }
 }
 
-export default LatZeroClient;
-export { LatZeroAsyncClient };
+module.exports = LatZeroClient;
+module.exports.LatZeroAsyncClient = LatZeroAsyncClient;
