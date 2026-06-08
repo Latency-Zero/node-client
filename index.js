@@ -285,8 +285,8 @@ class LatZeroClient extends LatZeroBaseClient {
 
         return Promise.race([
             this._startConnect()
-                .then(() => callback(null))
-                .catch(e => callback(e)),
+                .then(() => callback?.(null))
+                .catch(e => callback?.(e)),
             new Promise((resolve, reject) => {
                 this.once('connect', ()=> {
                     callback?.(null)

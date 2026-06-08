@@ -244,19 +244,30 @@ class LatZeroClient extends LatZeroBaseClient {
     }
 
     connect(callback) {
-        if (callback) {
-            if (this._ready) { callback(null); return this; }
-            this.once('connect', () => callback(null));
-            this.once('error',   (e) => callback(e));
-            this._startConnect();
-            return this;
-        }
+        // if (callback) {
+        //     if (this._ready) { callback(null); return this; }
+        //     this.once('connect', () => callback(null));
+        //     this.once('error',   (e) => callback(e));
+        //     this._startConnect();
+        //     return this;
+        // }
         if (this._ready) return Promise.resolve();
-        this._startConnect();
-        return new Promise((resolve, reject) => {
-            this.once('connect', resolve);
-            this.once('error', reject);
-        });
+
+        return Promise.race([
+            this._startConnect()
+                .then(() => callback?.(null))
+                .catch(e => callback?.(e)),
+            new Promise((resolve, reject) => {
+                this.once('connect', ()=> {
+                    callback?.(null)
+                    resolve();
+                });
+                this.once('error', (e) => {
+                    callback?.(e)
+                    reject(e);
+                });
+            })
+        ])
     }
 
     _makeProcessProxy() {
@@ -343,6 +354,10 @@ class LatZeroClient extends LatZeroBaseClient {
 
     keys(pattern = null) {
         return this._q('list_buffers', { pattern }).then(r => r.payload?.keys || []);
+    }
+
+    clients() {
+        return this._q('list_clients', {}).then(r => r.payload?.clients || []);
     }
 
     values(pattern = null) {
@@ -521,6 +536,11 @@ class LatZeroAsyncClient extends LatZeroBaseClient {
     async keys(pattern = null) {
         const r = await this.sendRequest('list_buffers', { pattern });
         return r.payload?.keys || [];
+    }
+
+    async clients() {
+        const r = await this.sendRequest('list_clients', {});
+        return r.payload?.clients || [];
     }
 
     async values(pattern = null) {
