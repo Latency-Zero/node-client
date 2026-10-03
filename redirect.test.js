@@ -519,6 +519,8 @@ for (const [label, Client, queued] of variants) {
             if (msg.type === 'join_pool') peer.ack(msg);
         });
         const client = clientFor(t, Client, owner, { timeout: 100 });
+        const errors = [];
+        client.on('error', err => errors.push(err));
         await client.connect();
         const switching = client.switchPool('pool-b', 'secret');
         const rejected = assert.rejects(switching, err => err.code === 'timeout');
@@ -541,6 +543,7 @@ for (const [label, Client, queued] of variants) {
         assert.equal(client.pending.size, 0);
         assert.equal(client._switching, false);
         assert.equal(clock.timers.size, 0);
+        assert.equal(errors.length, 1);
     });
 
     test(`${label}: owner auth denial propagates through connect/switch without retry or stale rollback`, { timeout: 10000 }, async t => {
@@ -660,6 +663,31 @@ for (const [label, Client, queued] of variants) {
         assert.equal(disconnected, 1);
         assert.equal(unused.records.length, 0);
         assert.equal(server.records.filter(record => record.msg.type === 'hello').length, 1);
+    });
+
+    test(`${label}: failed owner handoff cannot let its old switch hook close an explicit reconnect`, { timeout: 10000 }, async t => {
+        const badOwner = await tcpFixture(t, (msg, peer) => {
+            if (msg.type === 'hello') peer.socket.end('{bad-owner-frame}\n');
+        }, false);
+        const server = await tcpFixture(t, (msg, peer) => {
+            if (msg.type === 'join_pool') peer.ack(msg);
+            if (msg.type === 'switch_pool') peer.send(redirect(msg, badOwner, server));
+        });
+        const client = clientFor(t, Client, server);
+        await client.connect();
+        let reconnected;
+        const errors = [];
+        client.on('error', err => { errors.push(err); if (errors.length === 1) reconnected = client.connect(); });
+        await assert.rejects(client.switchPool('pool-b'), err => err.code === 'protocol_error');
+        await reconnected;
+        assert.equal(errors.length, 1);
+        assert.equal(client._ready, true);
+        assert.equal(client.connected, true);
+        assert.equal(client.poolName, 'pool-a');
+        assert.equal(client.endpoint.port, server.port);
+        assert.equal(client._switching, false);
+        assert.equal(server.records.filter(record => record.msg.type === 'hello').length, 2);
+        assert.equal(badOwner.records.filter(record => record.msg.type === 'hello').length, 1);
     });
 
     test(`${label}: low-level membership redirects retain the final ACK envelope contract`, { timeout: 10000 }, async t => {
