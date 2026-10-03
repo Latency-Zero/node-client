@@ -11,7 +11,7 @@
     }
   },
   "scripts": {
-    "test": "node --test test.js"
+    "test": "node --test test.js redirect.test.js"
   },
   "dependencies": {},
   "keywords": ["latzero", "ipc", "shared-memory", "client"],
