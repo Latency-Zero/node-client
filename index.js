@@ -34,13 +34,19 @@ class LatZeroBaseClient extends EventEmitter {
         this.maxFrameBytes = options.maxFrameBytes ?? 1024 * 1024;
         this.maxBatchSize = options.maxBatchSize ?? 256;
         this.maxConcurrentHandlers = options.maxConcurrentHandlers ?? 64;
+        this.maxRedirects = options.maxRedirects ?? 4;
+        this.allowRedirects = options.allowRedirects ?? true;
         this._timeoutMs(this.timeout);
         for (const name of ['maxPendingRequests', 'maxQueuedBytes', 'maxFrameBytes', 'maxBatchSize', 'maxConcurrentHandlers']) {
             if (!Number.isSafeInteger(this[name]) || this[name] <= 0) throw new TypeError(`${name} must be a positive integer`);
         }
+        if (!Number.isSafeInteger(this.maxRedirects) || this.maxRedirects < 0 || this.maxRedirects > 16) throw new TypeError('maxRedirects must be an integer from 0 to 16');
+        if (typeof this.allowRedirects !== 'boolean') throw new TypeError('allowRedirects must be a boolean');
 
         this.socket        = null;
         this.connected     = false;
+        this._socketConnected = false;
+        this._endpoint = null;
         this.pending       = new Map();
         this.messageBuffer = '';
         this._processes    = new Map();
@@ -53,6 +59,7 @@ class LatZeroBaseClient extends EventEmitter {
         this._connecting = false;
         this._connectionPromise = null;
         this._connectionReject = null;
+        this._connectionFlow = null;
         this._connectTimer = null;
         this._drainTimer = null;
         this._writeBlocked = false;
@@ -67,50 +74,62 @@ class LatZeroBaseClient extends EventEmitter {
 
     _createSocket() { return new net.Socket(); }
 
+    get endpoint() { return this._endpoint; }
+
     _connectSocket() {
         if (this._connectionPromise) return this._connectionPromise;
-        const socket = this._createSocket();
-        const decoder = new StringDecoder('utf8');
-        const deadline = performance.now() + this.timeout;
-        let resolveConnection;
+        const flow = this._redirectFlow(this.poolName, this.authToken, performance.now() + this.timeout, 'connect');
+        const promise = this._beginConnection(flow);
+        this._openSocket({ host: this.host, port: this.port }, flow);
+        return promise;
+    }
+
+    _beginConnection(flow) {
         this._connectionPromise = new Promise((resolve, reject) => {
-            resolveConnection = resolve;
+            flow.resolve = resolve;
             this._connectionReject = reject;
         });
         const promise = this._connectionPromise;
         // Auto-connect may have no caller yet; explicit connect still receives rejection.
         promise.catch(() => {});
-        this.socket = socket;
+        this._connectionFlow = flow;
         this._connecting = true;
-        this.messageBuffer = '';
+        clearTimeout(this._connectTimer);
         this._connectTimer = setTimeout(() => {
-            if (this.socket === socket) this._closeConnection(this._error('Connection timeout', 'timeout'), true);
-        }, this.timeout);
+            if (this._connectionFlow === flow) this._closeConnection(this._error(flow.kind === 'connect' ? 'Connection timeout' : 'Request timeout', 'timeout'), true);
+        }, Math.max(1, flow.deadline - performance.now()));
+        return promise;
+    }
+
+    _openSocket(endpoint, flow) {
+        if (this._connectionFlow !== flow) return;
+        if (flow.deadline <= performance.now()) {
+            this._closeConnection(this._error(flow.kind === 'connect' ? 'Connection timeout' : 'Request timeout', 'timeout'), true);
+            return;
+        }
+        let socket;
+        try { socket = this._createSocket(); }
+        catch (err) { this._closeConnection(err, true); return; }
+        const decoder = new StringDecoder('utf8');
+        this.socket = socket;
+        this._endpoint = Object.freeze({ host: endpoint.host, port: endpoint.port });
+        this._socketConnected = false;
+        this.messageBuffer = '';
 
         socket.on('connect', () => {
             if (this.socket !== socket) return;
-            this.connected = true;
-            this._request('hello', {}, null, { handshake: true, deadline }, false)
+            const onFailure = err => { if (this.socket === socket) this._closeConnection(err, true); };
+            this._socketConnected = true;
+            this._request('hello', { capabilities: ['pool_redirect_v1'] }, null, {
+                handshake: true, deadline: flow.deadline, clientId: flow.clientId, onFailure
+            }, false)
                 .then(() => {
                     if (this.socket !== socket) throw this._error('Connection closed', 'connection_lost');
                     return this._request('join_pool', {
-                        client_id: this.clientId, pool: this.poolName, auth_token: this.authToken
+                        client_id: flow.clientId, pool: flow.pool, auth_token: flow.token
                     }, null, {
-                        handshake: true, deadline,
-                        onSuccess: () => {
-                            if (this.socket !== socket) return;
-                            this._ready = true;
-                            this._connecting = false;
-                            clearTimeout(this._connectTimer);
-                            this._connectTimer = null;
-                            this._outbox = this._outbox.concat(this._opQueue);
-                            this._opQueue = [];
-                            this._flushWrites();
-                            if (this.socket !== socket || !this._ready) return;
-                            this._connectionReject = null;
-                            resolveConnection();
-                            this.emit('connect');
-                        }
+                        handshake: true, deadline: flow.deadline, clientId: flow.clientId, redirectFlow: flow, onFailure,
+                        onSuccess: result => this._joined(socket, flow, result)
                     }, false);
                 })
                 .catch(err => {
@@ -140,7 +159,7 @@ class LatZeroBaseClient extends EventEmitter {
                 try { this.handleMessage(msg); }
                 catch (err) { this._reportError(err); }
             }
-            if (Buffer.byteLength(this.messageBuffer) > this.maxFrameBytes) {
+            if (this.socket === socket && Buffer.byteLength(this.messageBuffer) > this.maxFrameBytes) {
                 this._closeConnection(this._error('Incoming frame exceeds maxFrameBytes', 'frame_too_large'), true);
             }
         });
@@ -157,14 +176,123 @@ class LatZeroBaseClient extends EventEmitter {
         socket.on('close', () => {
             if (this.socket === socket) this._closeConnection(this._error('Connection closed', 'connection_lost'));
         });
-        try { socket.connect(this.port, this.host); }
+        try { socket.connect(endpoint.port, endpoint.host); }
         catch (err) { this._closeConnection(err, true); }
+    }
+
+    _joined(socket, flow, result) {
+        if (this.socket !== socket || this._connectionFlow !== flow) return;
+        this._ready = this.connected = true;
+        this._connecting = false;
+        if (flow.kind === 'switch') {
+            this.poolName = flow.pool;
+            this.authToken = flow.token;
+            this._switching = false;
+        }
+        clearTimeout(this._connectTimer);
+        this._connectTimer = null;
+        this._outbox = this._outbox.concat(this._opQueue);
+        this._opQueue = [];
+        this._flushWrites();
+        if (this.socket !== socket || !this._ready || this._connectionFlow !== flow) return;
+        this._connectionReject = this._connectionFlow = null;
+        const transition = flow.transitionEntry;
+        flow.transitionEntry = null;
+        try { transition?.onSuccess?.(result); }
+        finally {
+            flow.resolve();
+            this.emit('connect');
+        }
+    }
+
+    _redirectFlow(pool, token, deadline, kind) {
+        const endpoint = this._endpoint || { host: this.host, port: this.port };
+        const visited = new Set([this._endpointKey(endpoint.host, endpoint.port)]);
+        if (typeof endpoint.host === 'string' && endpoint.host.toLowerCase() === 'localhost') {
+            visited.add(this._endpointKey('::1', endpoint.port));
+        }
+        return { clientId: this.clientId, pool, token, deadline, kind, entryHost: this.host, visited, pods: new Set(), hops: 0, metadata: null };
+    }
+
+    _loopbackHost(host) {
+        if (typeof host !== 'string' || host.includes('%')) return null;
+        if (net.isIP(host) === 4) return host.startsWith('127.') ? host : null;
+        if (net.isIP(host) === 6) {
+            const normalized = new URL(`http://[${host}]/`).hostname.slice(1, -1);
+            return normalized === '::1' ? normalized : null;
+        }
+        return null;
+    }
+
+    _endpointKey(host, port) {
+        return `${this._loopbackHost(host) || (typeof host === 'string' && host.toLowerCase() === 'localhost' ? '127.0.0.1' : host)}|${port}`;
+    }
+
+    _redirectTarget(msg, entry) {
+        const flow = entry.redirectFlow;
+        const fail = (message, code = 'invalid_redirect') => { throw this._error(message, code); };
+        if (!this.allowRedirects || this.maxRedirects === 0) fail('Pool owner redirect required but redirects are disabled', 'redirect_required');
+        if (!flow || msg.client_id !== flow.clientId || typeof flow.pool !== 'string' || !flow.pool || msg.pool !== flow.pool) fail('Redirect identity or pool does not match the request');
+        if (!this._loopbackHost(flow.entryHost) && !(typeof flow.entryHost === 'string' && flow.entryHost.toLowerCase() === 'localhost')) fail('Redirects require a loopback or localhost entry host', 'unsafe_redirect');
+        const payload = msg.payload;
+        const port = value => Number.isSafeInteger(value) && value > 0 && value <= 65535;
+        const wsPort = value => value === null || port(value);
+        if (!payload || Array.isArray(payload) || typeof payload !== 'object' || payload.protocol !== 'pool_redirect_v1' || payload.pool !== flow.pool) fail('Invalid redirect protocol or target pool');
+        const host = this._loopbackHost(payload.host);
+        const routerHost = this._loopbackHost(payload.router_host);
+        if (!host || !routerHost) fail('Redirect hosts must be numeric loopback addresses', 'unsafe_redirect');
+        if (!port(payload.port) || !wsPort(payload.ws_port) || !port(payload.router_port) || !wsPort(payload.router_ws_port)) fail('Invalid redirect port');
+        if (!Number.isSafeInteger(payload.pod_count) || payload.pod_count < 1 || payload.pod_count > 64 || !Number.isSafeInteger(payload.pod_index) || payload.pod_index < 0 || payload.pod_index >= payload.pod_count) fail('Invalid redirect pod index or count');
+        if (typeof payload.cluster_id !== 'string' || !payload.cluster_id.trim()) fail('Invalid redirect cluster ID');
+        const metadata = JSON.stringify([payload.cluster_id, payload.pod_count, routerHost, payload.router_port, payload.router_ws_port]);
+        if (flow.metadata !== null && flow.metadata !== metadata) fail('Redirect cluster or router changed during the operation');
+        const key = this._endpointKey(host, payload.port);
+        if (flow.visited.has(key) || flow.pods.has(payload.pod_index)) fail('Pool redirect loop', 'redirect_loop');
+        if (flow.hops >= this.maxRedirects) fail('Pool redirect hop limit exceeded', 'redirect_limit');
+        return { host, port: payload.port, key, pod: payload.pod_index, metadata };
+    }
+
+    _followRedirect(target, entry) {
+        const flow = entry.redirectFlow;
+        flow.hops++;
+        flow.visited.add(target.key);
+        flow.pods.add(target.pod);
+        flow.metadata = target.metadata;
+        if (flow.kind === 'switch' && this._connectionFlow !== flow) {
+            flow.transitionEntry = entry;
+            this._beginConnection(flow);
+        }
+        const promise = this._connectionPromise;
+        const socket = this.socket;
+        const wasReady = this._ready;
+        // Initial hops share one work generation; a registered owner replacement fences it.
+        if (flow.kind === 'switch') this._generation++;
+        this.socket = this._endpoint = null;
+        this._socketConnected = this.connected = this._ready = false;
+        this._writeBlocked = false;
+        clearTimeout(this._drainTimer);
+        this._drainTimer = null;
+        this.messageBuffer = '';
+        const err = this._error('Transport replaced by pool owner redirect; work was not replayed', 'connection_replaced');
+        for (const id of [...this.pending.keys()]) this._settle(id, err);
+        for (const frame of [...this._outbox, ...this._opQueue]) clearTimeout(frame.timer);
+        this._outbox = [];
+        this._opQueue = [];
+        this._queuedBytes = 0;
+        this._processes.clear();
+        this._registrations.clear();
+        this._switching = flow.kind === 'switch';
+        socket?.destroy();
+        if (wasReady) this.emit('disconnect');
+        this._openSocket(target, flow);
         return promise;
     }
 
     _closeConnection(err, report = false) {
         const socket = this.socket;
         this.socket = null;
+        this._endpoint = null;
+        this._socketConnected = false;
         this.connected = false;
         this._ready = false;
         this._connecting = false;
@@ -176,6 +304,7 @@ class LatZeroBaseClient extends EventEmitter {
         this._writeBlocked = false;
         const rejectConnection = this._connectionReject;
         this._connectionReject = this._connectionPromise = null;
+        this._connectionFlow = null;
         this._processes.clear();
         this._registrations.clear();
         for (const id of [...this.pending.keys()]) this._settle(id, err);
@@ -200,7 +329,7 @@ class LatZeroBaseClient extends EventEmitter {
         const { type, request_id, payload } = msg;
         const entry = this.pending.get(request_id);
         if (entry?.sent && entry.generation === this._generation) {
-            if (['ack', 'error', 'app_result'].includes(type) && entry.deadline <= performance.now()) {
+            if (['ack', 'error', 'app_result', 'redirect'].includes(type) && entry.deadline <= performance.now()) {
                 this._settle(request_id, this._error(entry.timeoutMessage, 'timeout'));
                 this.handleServerMessage(msg);
                 return;
@@ -209,6 +338,18 @@ class LatZeroBaseClient extends EventEmitter {
                 const err = this._error(payload?.message || 'Server error', payload?.code || 'server_error');
                 err.protocol = true;
                 this._settle(request_id, err);
+                return;
+            }
+            if (type === 'redirect') {
+                if (!['join_pool', 'switch_pool'].includes(entry.requestType)) return;
+                let target;
+                try { target = this._redirectTarget(msg, entry); }
+                catch (err) {
+                    this._settle(request_id, err);
+                    if (this.socket) this._closeConnection(err, true);
+                    return;
+                }
+                this._settle(request_id, null, { ...msg }, target);
                 return;
             }
             if (type === 'ack') {
@@ -323,7 +464,7 @@ class LatZeroBaseClient extends EventEmitter {
                 const deadline = options.deadline ?? performance.now() + ms;
                 if (this._switching && !options.allowSwitch && !options.handshake) throw this._error('Pool switch in progress', 'pool_switching');
                 if (!options.handshake && !this._ready && !queue) throw this._error('Not connected to server', 'not_connected');
-                if (options.handshake && !this.connected) throw this._error('Not connected to server', 'not_connected');
+                if (options.handshake && !this._socketConnected) throw this._error('Not connected to server', 'not_connected');
                 if (!options.handshake && this._pendingUsers >= this.maxPendingRequests) throw this._error('Outstanding request limit reached', 'client_overloaded');
                 const requestId = this.generateRequestId();
                 const kind = rpc ? (payload?.response_to && payload.response_to !== this.clientId ? 'acceptance' : 'result') : 'ack';
@@ -331,13 +472,18 @@ class LatZeroBaseClient extends EventEmitter {
                     requestId, requestType: type, kind, resolve, reject, deadline,
                     generation: this._generation, handshake: !!options.handshake,
                     onSuccess: options.onSuccess, onFailure: options.onFailure,
+                    redirectFlow: options.redirectFlow,
                     timeoutMessage: options.timeoutMessage || (type === 'call_process' ? 'Process call timeout' : type === 'call_app' ? 'Call event timeout' : 'Request timeout'),
                     sent: false, frame: null, timer: null
                 };
                 const frame = this._encode({
-                    type, request_id: requestId, client_id: this.clientId,
+                    type, request_id: requestId, client_id: options.clientId ?? this.clientId,
                     pool: pool !== undefined ? pool : this.poolName, payload: payload || {}
                 });
+                if (['join_pool', 'switch_pool'].includes(type) && !entry.redirectFlow) {
+                    const encodedPayload = JSON.parse(frame).payload;
+                    entry.redirectFlow = this._redirectFlow(encodedPayload?.pool, encodedPayload?.auth_token ?? null, deadline, 'switch');
+                }
                 this.pending.set(requestId, entry);
                 if (!entry.handshake) this._pendingUsers++;
                 const remaining = deadline - performance.now();
@@ -378,7 +524,7 @@ class LatZeroBaseClient extends EventEmitter {
     }
 
     _flushWrites() {
-        while (this.connected && this.socket && !this._writeBlocked && this._outbox.length) {
+        while (this._socketConnected && this.socket && !this._writeBlocked && this._outbox.length) {
             const frame = this._outbox[0];
             const entry = frame.entry;
             if (frame.deadline <= performance.now()) {
@@ -445,7 +591,7 @@ class LatZeroBaseClient extends EventEmitter {
         if (frame.entry) frame.entry.frame = null;
     }
 
-    _settle(requestId, err, result) {
+    _settle(requestId, err, result, redirect = null) {
         const entry = this.pending.get(requestId);
         if (!entry) return;
         this.pending.delete(requestId);
@@ -456,6 +602,14 @@ class LatZeroBaseClient extends EventEmitter {
         if (err) {
             try { entry.onFailure?.(err, entry); }
             finally { entry.reject(err); }
+        } else if (redirect) {
+            try {
+                const promise = this._followRedirect(redirect, entry);
+                entry.resolve(promise.catch(failure => { entry.onFailure?.(failure, entry); throw failure; }));
+            } catch (failure) {
+                try { entry.onFailure?.(failure, entry); }
+                finally { entry.reject(failure); this._closeConnection(failure, true); }
+            }
         } else {
             try { entry.onSuccess?.(result); }
             finally { entry.resolve(result); }
@@ -570,8 +724,11 @@ class LatZeroBaseClient extends EventEmitter {
     _switchPool(pool, authToken) {
         if (this._switching) return Promise.reject(this._error('Pool switch in progress', 'pool_switching'));
         const token = authToken || this.authToken;
+        const deadline = performance.now() + this.timeout;
+        const redirectFlow = this._redirectFlow(pool, token, deadline, 'switch');
         if (pool === this.poolName) {
             return this._q('switch_pool', { client_id: this.clientId, pool, auth_token: token }, null, {
+                deadline, redirectFlow,
                 onSuccess: () => { this.authToken = token; }
             });
         }
@@ -593,7 +750,7 @@ class LatZeroBaseClient extends EventEmitter {
         }
         const generation = this._generation;
         return this._q('switch_pool', { client_id: this.clientId, pool, auth_token: token }, null, {
-            allowSwitch: true,
+            allowSwitch: true, deadline, redirectFlow,
             onSuccess: () => {
                 this.poolName = pool;
                 this.authToken = token;
