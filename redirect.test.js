@@ -247,9 +247,7 @@ for (const [label, Client, queued] of variants) {
     });
 
     test(`${label}: owner-changing switch fences handlers/routes, captures auth, and commits before following frames`, { timeout: 10000 }, async t => {
-        let holdNewOwner = true;
         const ownerB = await tcpFixture(t, (msg, peer) => {
-            if (msg.type === 'join_pool' && !holdNewOwner) peer.ack(msg);
             if (['register_process', 'switch_pool'].includes(msg.type)) peer.ack(msg);
         });
         const ownerA = await tcpFixture(t, (msg, peer) => {
@@ -335,7 +333,6 @@ for (const [label, Client, queued] of variants) {
         await resultBarrier;
         assert.deepEqual(results, [unsolicited]);
         assert.deepEqual(lifecycle, ['connect', 'disconnect', 'connect']);
-        holdNewOwner = false;
     });
 
     test(`${label}: redirects are consumed only by sent/correlated membership requests`, { timeout: 10000 }, async t => {
@@ -355,8 +352,6 @@ for (const [label, Client, queued] of variants) {
             const call = client.sendRequest(type, type === 'get_buffer' ? { key: 'key' } : type === 'register_process' ? { process_name: 'job' } : { event: 'job', process_id: 'worker:job' });
             const wire = await server.waitFor(record => record.msg.type === type);
             wire.peer.send(redirect({ ...wire.msg, payload: { pool: 'pool-a' } }, unused, server));
-            const done = deferred();
-            call.then(done.resolve, done.resolve);
             // A same-stream control barrier makes the ignored redirect precede the observed response.
             const barrier = client.sendRequest('list_clients', {});
             const barrierWire = await server.waitFor(record => record.msg.type === 'list_clients' && !record.used);
@@ -618,6 +613,155 @@ for (const [label, Client, queued] of variants) {
         for (const maxRedirects of [0, 4, 16]) {
             assert.equal(clientFor(t, Client, { port: 1 }, { maxRedirects }).maxRedirects, maxRedirects);
         }
+    });
+
+    test(`${label}: error listener explicit reconnect survives invalid-router cleanup`, { timeout: 10000 }, async t => {
+        let first = true;
+        const owner = await tcpFixture(t, (msg, peer) => {
+            if (msg.type === 'join_pool') peer.ack(msg);
+        });
+        const router = await tcpFixture(t, (msg, peer) => {
+            if (msg.type !== 'join_pool') return;
+            const packet = redirect(msg, owner, router);
+            if (first) { first = false; packet.payload.port = 0; }
+            peer.send(packet);
+        });
+        const client = clientFor(t, Client, router);
+        let reconnected;
+        let errors = 0;
+        client.on('error', () => { errors++; reconnected = client.connect(); });
+        const connection = client.connect();
+        await assert.rejects(connection, err => err.code === 'invalid_redirect');
+        await reconnected;
+        assert.equal(errors, 1);
+        assert.equal(client._ready, true);
+        assert.equal(client.connected, true);
+        assert.equal(client.endpoint.port, owner.port);
+        assert.equal(router.records.filter(record => record.msg.type === 'hello').length, 2);
+    });
+
+    test(`${label}: disconnect listener can cancel an intentional owner handoff without reconnect`, { timeout: 10000 }, async t => {
+        const unused = await tcpFixture(t);
+        const server = await tcpFixture(t, (msg, peer) => {
+            if (msg.type === 'join_pool') peer.ack(msg);
+            if (msg.type === 'switch_pool') peer.send(redirect(msg, unused, server));
+        });
+        const client = clientFor(t, Client, server);
+        await client.connect();
+        let disconnected = 0;
+        client.on('disconnect', () => { disconnected++; client.disconnect(); });
+        await assert.rejects(client.switchPool('pool-b'), err => err.code === 'disconnected');
+        await nextTurn();
+        assert.equal(client.socket, null);
+        assert.equal(client._connectionPromise, null);
+        assert.equal(client._connecting, false);
+        assert.equal(disconnected, 1);
+        assert.equal(unused.records.length, 0);
+        assert.equal(server.records.filter(record => record.msg.type === 'hello').length, 1);
+    });
+
+    test(`${label}: low-level membership redirects retain the final ACK envelope contract`, { timeout: 10000 }, async t => {
+        for (const type of ['join_pool', 'switch_pool']) {
+            const owner = await tcpFixture(t, (msg, peer) => {
+                if (msg.type === 'join_pool') peer.ack(msg, { joined: true, owner: 'final-owner' });
+            });
+            const server = await tcpFixture(t, (msg, peer) => {
+                if (msg.type === 'join_pool' && msg.payload.pool === 'pool-a') peer.ack(msg);
+                else if (msg.type === type) peer.send(redirect(msg, owner, server));
+            });
+            const client = clientFor(t, Client, server);
+            await client.connect();
+            const response = await client.sendRequest(type, { client_id: client.clientId, pool: 'pool-b', auth_token: 'token' });
+            const joined = owner.records.find(record => record.msg.type === 'join_pool').msg;
+            assert.deepEqual(response, { type: 'ack', request_id: joined.request_id, pool: null, payload: { joined: true, owner: 'final-owner' } });
+            assert.equal(client.poolName, 'pool-b');
+            assert.equal(client.authToken, 'token');
+            assert.equal(client.endpoint.port, owner.port);
+            assert.equal(client.pending.size, 0);
+        }
+    });
+
+    test(`${label}: same-pool redirected replacement rejects remaining routes and registrations`, { timeout: 10000 }, async t => {
+        const owner = await tcpFixture(t, (msg, peer) => {
+            if (msg.type === 'join_pool') peer.ack(msg);
+        });
+        const server = await tcpFixture(t, (msg, peer) => {
+            if (['join_pool', 'register_process'].includes(msg.type)) peer.ack(msg);
+            if (msg.type === 'switch_pool') peer.send(redirect(msg, owner, server));
+        });
+        const client = clientFor(t, Client, server);
+        await client.connect();
+        const started = deferred();
+        const release = deferred();
+        let calls = 0;
+        await client.process.register(async () => { calls++; started.resolve(); return release.promise; }, 'job');
+        const oldHandler = client._handleAppCall({ type: 'call_app', request_id: 'same-pool-old-hop', pool: null, payload: { event: 'pod-node:job', data: {} } });
+        await started.promise;
+        const pending = client.process.call('worker:pending');
+        const rejected = assert.rejects(pending, err => err.code === 'connection_replaced');
+        const generation = client._generation;
+        await client.switchPool('pool-a');
+        await rejected;
+        assert.ok(client._generation > generation);
+        assert.equal(client._processes.size, 0);
+        assert.equal(client._registrations.size, 0);
+        assert.equal(client.poolName, 'pool-a');
+        release.resolve('stale');
+        await oldHandler;
+        assert.equal(calls, 1);
+        assert.equal(server.records.some(record => record.msg.type === 'app_result'), false);
+        assert.equal(owner.records.some(record => ['app_result', 'call_process', 'register_process'].includes(record.msg.type)), false);
+        assert.equal(client.pending.size, 0);
+    });
+
+    test(`${label}: redirects for unsent membership and expired waiters cannot create a socket hop`, { timeout: 10000 }, async t => {
+        const clock = controlledTime(t);
+        const unused = await tcpFixture(t);
+        const server = await tcpFixture(t, (msg, peer) => {
+            if (msg.type === 'join_pool') peer.ack(msg);
+            if (msg.type === 'list_clients') peer.ack(msg);
+        });
+        const client = clientFor(t, Client, server, { timeout: 100 });
+        await client.connect();
+        client._writeBlocked = true;
+        const switching = client.switchPool('pool-b');
+        const rejection = assert.rejects(switching, err => err.code === 'timeout');
+        const entry = [...client.pending.values()].find(item => item.requestType === 'switch_pool');
+        const packet = redirect({ request_id: entry.requestId, client_id: client.clientId, payload: { pool: 'pool-b' } }, unused, server);
+        const peer = [...server.peers][0];
+        peer.send(packet);
+        // Process the uncorrelated frame before releasing the writer's explicit barrier.
+        const observed = deferred();
+        const handle = client.handleMessage.bind(client);
+        client.handleMessage = msg => { handle(msg); if (msg.type === 'redirect') observed.resolve(); };
+        await observed.promise;
+        assert.equal(client.pending.has(entry.requestId), true);
+        assert.equal(entry.sent, false);
+        clock.advance(100);
+        await rejection;
+        assert.equal(client._ready, true, 'unsent switch failure leaves known old membership');
+        peer.send(packet);
+        client._writeBlocked = false;
+        const barrier = client.clients();
+        await barrier;
+        assert.equal(unused.records.length, 0);
+        assert.equal(server.records.some(record => record.msg.type === 'switch_pool'), false);
+        assert.equal(client._switching, false);
+        assert.equal(client.pending.size, 0);
+    });
+
+    test(`${label}: numeric IPv4 loopback and expanded IPv6 loopback normalize without DNS targets`, async t => {
+        const client = clientFor(t, Client, { port: 10001 }, { host: 'LOCALHOST' });
+        const flow = client._redirectFlow('pool-a', null, performance.now() + 1000, 'connect');
+        const packet = redirect({ request_id: 'membership', client_id: client.clientId, payload: { pool: 'pool-a' } }, { port: 10002 }, { port: 10001 }, {
+            host: '0:0:0:0:0:0:0:1', router_host: '127.0.0.2', ws_port: 10003, router_ws_port: 10004
+        });
+        assert.equal(client._redirectTarget(packet, { redirectFlow: flow }).host, '::1');
+        packet.payload.host = '127.255.0.1';
+        assert.equal(client._redirectTarget(packet, { redirectFlow: flow }).host, '127.255.0.1');
+        packet.payload.host = '::1';
+        packet.payload.port = 10001;
+        assert.throws(() => client._redirectTarget(packet, { redirectFlow: flow }), err => err.code === 'redirect_loop');
     });
 
     if (queued) {

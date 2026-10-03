@@ -200,7 +200,7 @@ class LatZeroBaseClient extends EventEmitter {
         flow.transitionEntry = null;
         try { transition?.onSuccess?.(result); }
         finally {
-            flow.resolve();
+            flow.resolve(flow.kind === 'connect' ? undefined : result);
             this.emit('connect');
         }
     }
@@ -345,8 +345,9 @@ class LatZeroBaseClient extends EventEmitter {
                 let target;
                 try { target = this._redirectTarget(msg, entry); }
                 catch (err) {
+                    const socket = this.socket;
                     this._settle(request_id, err);
-                    if (this.socket) this._closeConnection(err, true);
+                    if (socket && this.socket === socket) this._closeConnection(err, true);
                     return;
                 }
                 this._settle(request_id, null, { ...msg }, target);
@@ -603,12 +604,16 @@ class LatZeroBaseClient extends EventEmitter {
             try { entry.onFailure?.(err, entry); }
             finally { entry.reject(err); }
         } else if (redirect) {
+            const flow = entry.redirectFlow;
             try {
                 const promise = this._followRedirect(redirect, entry);
                 entry.resolve(promise.catch(failure => { entry.onFailure?.(failure, entry); throw failure; }));
             } catch (failure) {
                 try { entry.onFailure?.(failure, entry); }
-                finally { entry.reject(failure); this._closeConnection(failure, true); }
+                finally {
+                    entry.reject(failure);
+                    if (this._connectionFlow === flow) this._closeConnection(failure, true);
+                }
             }
         } else {
             try { entry.onSuccess?.(result); }
