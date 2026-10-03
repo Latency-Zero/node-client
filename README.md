@@ -102,7 +102,7 @@ This package exports **two clients** with different ergonomics for different use
 
 The default client. Operations are queued internally before the connection is established — you never need to `await` the connection or worry about race conditions on startup.
 
-**Writes** are fire-and-forget (return Promises you can ignore).  
+**Writes** return Promises; await them or attach `.catch()` to observe rejection.
 **Reads** return Promises you `.then()` or `await`.
 
 ```js
@@ -142,7 +142,7 @@ const val = await client.get('status');
 |---|---|---|
 | Style | Queue-first, sync-feel | Explicit async/await |
 | Pre-connect ops | ✅ Queued automatically | ❌ Must await connect first |
-| Write return value | Promise (ignorable) | Promise (must await) |
+| Write return value | Promise (await or catch) | Promise (await or catch) |
 | `connect()` | Optional; accepts callback | Must await |
 | Best for | Services, scripts, quick setup | Precise control, testing |
 
@@ -155,6 +155,23 @@ npm install latzero
 ```
 
 Requires Node.js 18+. Uses ES Modules (`"type": "module"` in package.json).
+
+CommonJS is also supported: `const LatZeroClient = require('latzero')` and
+`const { LatZeroAsyncClient } = require('latzero')`.
+
+### Stabilization Notes
+
+- Both exports share connection, correlation, deadline, and transport behavior. `connect()` returns a reusable Promise for the current connection; failure or disconnect resets readiness.
+- `on`, `off`, `once`, `removeListener`, and `emit` use standard Node `EventEmitter` semantics. `emit` is local; `emitEvent` sends a remote notification. The first listener for an event is used by `callEvent`, including `once` listeners.
+- Direct/self RPCs wait for `app_result`, not the acceptance ACK. Explicit `responseTo` naming another connected client returns acceptance metadata; that recipient receives the full result envelope through `app_result`. ACKs do not mean execution or durable commit.
+- `autoClean` has always been documented in milliseconds and now correctly divides by 1000 on the wire: `30000` expires after 30 seconds, not 30000 seconds. RPC timeouts also use fractional wire seconds.
+- One local deadline includes pre-connection admission, queued sends, ACK, and result waits. RPC wire timeouts are reduced to the remaining deadline when sent. All request timers and unsent frames are removed on settlement.
+- Outstanding requests, batches, handlers, frame bytes, and queued transport bytes have finite configurable limits. Overload rejects with `client_overloaded`; a stalled drain or undeliverable handler reply closes the connection instead of silently losing a frame.
+- Disconnect and a change of pool cancel outstanding old work, remove process registrations, and fence async replies to their incoming socket/pool/generation. Same-pool rejoin retains registrations and pending calls. User listeners remain installed. Explicitly reconnect, re-register processes, re-subscribe, and re-read state; notifications are not a replay log. Intentional disconnect never reconnects automatically.
+- No automatic replay, effectful retry, or worker threads are introduced. A timed-out transmitted request may still have executed. JavaScript handlers run on the Node event loop, and already-running user code cannot be forcibly cancelled.
+- Application replies retain `{ value, error }` inside `response.payload`; application errors resolve as raw replies, while protocol/transport failures reject. Thrown handler errors retain their type/message object; unserializable or oversized results become `{ value: null, error: '<message>' }`.
+
+Run `npm test` for the Node built-in suite covering ESM and CommonJS, both client classes, deterministic socket faults, and temporary-port raw TCP routing. It does not require a running daemon or use the default port/cache.
 
 Make sure a LatZero server is running:
 ```bash
@@ -226,9 +243,16 @@ new LatZeroAsyncClient(dsn, pool, options?)
 | `pool` | string | — | Pool name to join |
 | `options.host` | string | `'127.0.0.1'` | Server hostname |
 | `options.port` | number | `14130` | Server TCP port |
-| `options.timeout` | number | `5000` | Request timeout (ms) |
+| `options.timeout` | number | `5000` | End-to-end request/connect timeout (ms), positive finite, at most `2147483647` |
 | `options.authToken` | string | `null` | Optional pool auth token |
 | `options.autoConnect` | boolean | `true` | Connect on construction |
+| `options.maxPendingRequests` | integer | `1024` | Outstanding user requests, including pre-connect work |
+| `options.maxQueuedBytes` | integer | `1048576` | Encoded queued frames plus Node socket writable bytes |
+| `options.maxFrameBytes` | integer | `1048576` | Maximum encoded outgoing/incoming NDJSON frame bytes |
+| `options.maxBatchSize` | integer | `256` | Maximum entries in `mset`, `mget`, `deleteMany`, `values`, or `items` |
+| `options.maxConcurrentHandlers` | integer | `64` | Active async RPC handlers, including fenced work still finishing |
+
+Limits must be positive integers and are protective defaults, not throughput guarantees. Hello/join use a fixed 16 KiB transport reserve and one internal pending slot so pre-connect user requests cannot starve the handshake. Batch operations are not atomic; transmitted entries may have effects even if another entry is rejected.
 
 #### `connect(callback?)` — LatZeroClient only
 
@@ -254,6 +278,8 @@ await client.connect();
 ```js
 client.disconnect();
 ```
+
+Disconnect immediately fences old work, fails outstanding requests, and destroys the socket. It does not wait for a `leave_pool` ACK or replay queued requests. Call `connect()` explicitly to establish a fresh connection.
 
 #### `switchPool(pool, authToken?)`
 
@@ -360,7 +386,7 @@ Events are real-time push messages. They are **fire-and-forget** — no return v
 
 #### `on(event, handler)` / `off(event, handler)`
 
-Register or remove handlers for any event — including server lifecycle events.
+Register or remove handlers for any event, including server lifecycle events, with standard `EventEmitter` behavior. `once` and `removeListener` work with these same listeners, and handlers receive `this === client`. Process registration uses a separate single-function RPC map, not appended user listeners.
 
 ```js
 // Server lifecycle
@@ -369,6 +395,7 @@ client.on('disconnect',   ()    => console.log('Disconnected'));
 client.on('error',        (err) => console.error(err));
 client.on('presence',     (p)   => console.log('Presence:', p));
 client.on('bufferUpdate', (d)   => console.log('Buffer changed:', d));
+client.on('app_result',   (msg) => console.log('Unsolicited result:', msg.request_id, msg.payload));
 
 // Custom application events
 client.on('task:complete', (data) => saveResult(data));
@@ -393,7 +420,7 @@ client.emitEvent('user:refresh', {
 |---|---|---|
 | `data` | object | Payload sent to handlers |
 | `targetClientId` | string | Restrict to one recipient |
-| `responseTo` | string | Correlation ID for tracking |
+| `responseTo` | string | Optional recipient metadata; not a caller-chosen request ID |
 
 #### `callEvent(event, options)` — RPC via event name
 
@@ -410,6 +437,8 @@ console.log(response.payload.value); // { name: 'Alice', ... }
 ```
 
 > Handlers registered with `client.on('get-user-info', fn)` on the target client will be invoked, and their return value is sent back.
+
+The first listener is invoked and awaited. `responseTo` omitted, `null`, or equal to the calling client's ID waits for the terminal result. A different `responseTo` is the connected result-recipient client ID and returns an ACK envelope instead. Optional additive `request_id` fields are preserved; handler replies echo opaque incoming route IDs without interpreting them.
 
 ---
 
@@ -439,6 +468,8 @@ client.process.register(async (data) => {
 
 The process is reachable from any client in the pool as `clientId:processName`.
 
+Re-registering the same name replaces its function before advertising the registration; a rejected registration restores the previous function. Unregister failure similarly restores the handler. No Node worker threads are created: existing `workerKind`, `minWorkers`, and `maxWorkers` metadata do not move JavaScript execution off the event loop.
+
 #### `client.process.call(processId, data?, options?)`
 
 Call a specific process and wait for its return value.
@@ -451,9 +482,12 @@ console.log(r.payload.value); // 10
 // With timeout:
 const r = await client.process.call('slow-service:fetch', { id: 42 }, { timeout: 15000 });
 
-// Fire-and-forget (no return value needed):
-client.process.call('logger:log', { msg: 'Hello' }, { responseTo: null });
+// A different connected client receives the result; caller waits for acceptance:
+const accepted = await client.process.call('logger:log', { msg: 'Hello' }, { responseTo: 'dashboard' });
+console.log(accepted.type); // "ack"
 ```
+
+`responseTo: null` is not fire-and-forget; it retains the normal terminal result behavior. Attach `.catch()` if ignoring the returned Promise. Application `{ value, error }` shapes are not unwrapped or converted into transport exceptions.
 
 #### `client.process.broadcast(processName, data?, options?)`
 
@@ -548,14 +582,19 @@ console.log(`Distributed to ${workers.length} workers`);
 ### Correlation with `responseTo`
 
 ```js
-// Tag events/calls with a correlation ID for tracing:
-const correlationId = crypto.randomUUID();
-
-await client.emitEvent('job:start', {
-    data: { jobId: 42 },
-    responseTo: correlationId
+// On the connected result recipient (for example, client ID "dashboard"):
+dashboard.on('app_result', (envelope) => {
+    console.log(envelope.request_id, envelope.payload.value, envelope.payload.error);
 });
+
+// On a different caller:
+const acceptance = await client.process.call('worker:job', { jobId: 42 }, {
+    responseTo: 'dashboard'
+});
+console.log(acceptance.request_id, acceptance.payload.queued);
 ```
+
+`responseTo` is a client ID, not an arbitrary tracing token. Public result envelopes contain the origin request ID at top level and, with the stabilized server, in `payload.request_id`. The `app_result` hook also receives late results after a local timeout and independent broadcast child results, so use their correlation metadata instead of assuming one result per hook invocation.
 
 ---
 
@@ -581,7 +620,7 @@ try {
     const r = await client.process.call('slow-service:compute', data, { timeout: 3000 });
 } catch (err) {
     if (err.message === 'Process call timeout') {
-        console.warn('Service is slow, retrying...');
+        console.warn('Deadline exceeded; the transmitted call may still have executed.');
     }
 }
 
@@ -605,6 +644,8 @@ client.on('error', (err) => {
 | `Only JSON-serializable values are supported` | Passed a circular ref, function, or Symbol |
 | `Pass an explicit name for anonymous functions` | Registered `(data) => ...` without a name argument |
 | `callEvent requires targetClientId` | Forgot `targetClientId` option on `callEvent` |
+
+Limit rejections use `err.code === 'client_overloaded'`; oversized frames use `frame_too_large`, and local deadlines use `timeout`. Connection failures reject pending operations and are emitted to registered `error` listeners once. A missing `error` listener does not hide the Promise rejection; explicit `client.emit('error', err)` retains Node's normal unhandled-error behavior.
 
 ---
 

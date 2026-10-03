@@ -9,7 +9,7 @@ The LatZero Node.js Client is a comprehensive client library that provides both 
 - **Buffer Operations**: Set, get, delete, keys, values, items, mset, mget, etc.
 - **Process Pool**: Register, call, broadcast, and manage distributed processes
 - **Event System**: Real-time event handling and cross-process communication
-- **TCP Connection**: Reliable TCP connection with automatic reconnection
+- **TCP Connection**: Bounded TCP transport with explicit reconnection and no automatic replay
 - **Cross-Language Compatibility**: Works seamlessly with web and Python clients
 - **ES Modules**: Modern JavaScript with full async/await support
 
@@ -220,11 +220,17 @@ console.log(result.payload.value); // 8
 // With timeout
 const result = await client.process.call('client:process', { x: 10 }, { timeout: 10000 });
 
-// Non-blocking (fire and forget)
-await client.process.call('client:logger', { message: 'Task completed' }, { 
-    responseTo: null 
+// Return acceptance to this caller; a different connected client gets the result.
+await client.process.call('client:logger', { message: 'Task completed' }, {
+    responseTo: 'dashboard'
 });
 ```
+
+Omitted, `null`, or self `responseTo` waits for the terminal result. On the recipient,
+`client.on('app_result', envelope => ...)` receives the full envelope, with origin
+`request_id` correlation and raw `payload.value` / `payload.error`. ACK means
+acceptance, not execution or durability. Timeouts include admission and sending;
+transmitted calls may still execute after local timeout and are never replayed.
 
 #### client.process.broadcast(processName, data, options)
 Broadcast to all processes with a given name.
@@ -423,8 +429,7 @@ try {
     console.log('Value stored successfully');
 } catch (error) {
     if (error.code === 'timeout') {
-        console.log('Request timed out, retrying...');
-        await client.set('key', 'value');
+        console.log('Request deadline exceeded; a transmitted write may have succeeded.');
     } else {
         console.error('Operation failed:', error.message);
         throw error;
@@ -527,7 +532,7 @@ client.on('disconnect', () => {
 ### Error Recovery
 
 ```javascript
-// ✅ Good: Implement retry logic with exponential backoff
+// Opt-in retries require an application-specific idempotency contract.
 async function robustOperation(operation, maxRetries = 3) {
     for (let i = 0; i < maxRetries; i++) {
         try {
@@ -542,8 +547,8 @@ async function robustOperation(operation, maxRetries = 3) {
     }
 }
 
-// Usage
-await robustOperation(() => client.set('critical-key', 'value'));
+// Read-only usage; do not blindly retry effectful calls or writes.
+await robustOperation(() => client.get('critical-key'));
 ```
 
 ### Resource Management

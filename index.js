@@ -8,6 +8,8 @@
 
 import net from 'net';
 import { EventEmitter } from 'events';
+import { performance } from 'perf_hooks';
+import { StringDecoder } from 'string_decoder';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal base — shared TCP logic, message routing, event handling
@@ -26,80 +28,198 @@ class LatZeroBaseClient extends EventEmitter {
         this.authToken  = options.authToken || null;
         this.host       = options.host || '127.0.0.1';
         this.port       = options.port || 14130;
-        this.timeout    = options.timeout || 5000;
+        this.timeout    = options.timeout ?? 5000;
+        this.maxPendingRequests = options.maxPendingRequests ?? 1024;
+        this.maxQueuedBytes = options.maxQueuedBytes ?? 1024 * 1024;
+        this.maxFrameBytes = options.maxFrameBytes ?? 1024 * 1024;
+        this.maxBatchSize = options.maxBatchSize ?? 256;
+        this.maxConcurrentHandlers = options.maxConcurrentHandlers ?? 64;
+        this._timeoutMs(this.timeout);
+        for (const name of ['maxPendingRequests', 'maxQueuedBytes', 'maxFrameBytes', 'maxBatchSize', 'maxConcurrentHandlers']) {
+            if (!Number.isSafeInteger(this[name]) || this[name] <= 0) throw new TypeError(`${name} must be a positive integer`);
+        }
 
         this.socket        = null;
         this.connected     = false;
-        this.pending       = new Map();  // requestId → {resolve, reject, requestType}
-        this.eventHandlers = new Map();  // event/compound-key → [handlers]
+        this.pending       = new Map();
         this.messageBuffer = '';
-        this._processes    = new Map();  // short name → fn
+        this._processes    = new Map();
+        this._registrations = new Map();
+        this._opQueue = [];
+        this._outbox = [];
+        this._queuedBytes = 0;
+        this._pendingUsers = 0;
+        this._ready = false;
+        this._connecting = false;
+        this._connectionPromise = null;
+        this._connectionReject = null;
+        this._connectTimer = null;
+        this._drainTimer = null;
+        this._writeBlocked = false;
+        this._generation = 0;
+        this._requestSequence = 0;
+        this._activeHandlers = 0;
+        this._switching = false;
+        this._queueBeforeReady = false;
     }
 
     // ── Socket ────────────────────────────────────────────────────────────────
 
+    _createSocket() { return new net.Socket(); }
+
     _connectSocket() {
-        return new Promise((resolve, reject) => {
-            if (this.connected) { resolve(); return; }
-
-            this.socket = new net.Socket();
-            this.socket.connect(this.port, this.host);
-
-            this.socket.on('connect', () => {
-                this.connected = true;
-                this.sendRequest('hello', null, null)
-                    .then(() => this.sendRequest('join_pool', {
-                        client_id: this.clientId,
-                        pool:      this.poolName,
-                        auth_token: this.authToken
-                    }))
-                    .then(() => { this.emit('connect'); resolve(); })
-                    .catch(reject);
-            });
-
-            this.socket.on('data', (chunk) => {
-                this.messageBuffer += chunk.toString();
-                let idx;
-                while ((idx = this.messageBuffer.indexOf('\n')) !== -1) {
-                    const raw = this.messageBuffer.substring(0, idx);
-                    this.messageBuffer = this.messageBuffer.substring(idx + 1);
-                    if (raw.trim()) {
-                        try { this.handleMessage(JSON.parse(raw)); }
-                        catch (e) { console.error('[LatZero] Parse error:', e); }
-                    }
-                }
-            });
-
-            this.socket.on('error', (err) => {
-                this.connected = false;
-                this.emit('error', err);
-                reject(err);
-            });
-
-            this.socket.on('close', () => {
-                this.connected = false;
-                this.emit('disconnect');
-            });
+        if (this._connectionPromise) return this._connectionPromise;
+        const socket = this._createSocket();
+        const decoder = new StringDecoder('utf8');
+        const deadline = performance.now() + this.timeout;
+        let resolveConnection;
+        this._connectionPromise = new Promise((resolve, reject) => {
+            resolveConnection = resolve;
+            this._connectionReject = reject;
         });
+        const promise = this._connectionPromise;
+        // Auto-connect may have no caller yet; explicit connect still receives rejection.
+        promise.catch(() => {});
+        this.socket = socket;
+        this._connecting = true;
+        this.messageBuffer = '';
+        this._connectTimer = setTimeout(() => {
+            if (this.socket === socket) this._closeConnection(this._error('Connection timeout', 'timeout'), true);
+        }, this.timeout);
+
+        socket.on('connect', () => {
+            if (this.socket !== socket) return;
+            this.connected = true;
+            this._request('hello', {}, null, { handshake: true, deadline }, false)
+                .then(() => {
+                    if (this.socket !== socket) throw this._error('Connection closed', 'connection_lost');
+                    return this._request('join_pool', {
+                        client_id: this.clientId, pool: this.poolName, auth_token: this.authToken
+                    }, null, {
+                        handshake: true, deadline,
+                        onSuccess: () => {
+                            if (this.socket !== socket) return;
+                            this._ready = true;
+                            this._connecting = false;
+                            clearTimeout(this._connectTimer);
+                            this._connectTimer = null;
+                            this._outbox = this._outbox.concat(this._opQueue);
+                            this._opQueue = [];
+                            this._flushWrites();
+                            if (this.socket !== socket || !this._ready) return;
+                            this._connectionReject = null;
+                            resolveConnection();
+                            this.emit('connect');
+                        }
+                    }, false);
+                })
+                .catch(err => {
+                    if (this.socket === socket) this._closeConnection(err, true);
+                });
+        });
+        socket.on('data', chunk => {
+            if (this.socket !== socket) return;
+            this.messageBuffer += decoder.write(chunk);
+            let idx;
+            while (this.socket === socket && (idx = this.messageBuffer.indexOf('\n')) !== -1) {
+                const raw = this.messageBuffer.slice(0, idx);
+                this.messageBuffer = this.messageBuffer.slice(idx + 1);
+                if (Buffer.byteLength(raw) + 1 > this.maxFrameBytes) {
+                    this._closeConnection(this._error('Incoming frame exceeds maxFrameBytes', 'frame_too_large'), true);
+                    return;
+                }
+                if (!raw.trim()) continue;
+                let msg;
+                try {
+                    msg = JSON.parse(raw);
+                    if (!msg || Array.isArray(msg) || typeof msg !== 'object' || typeof msg.type !== 'string') throw new Error('Invalid message envelope');
+                } catch (err) {
+                    this._closeConnection(this._error(`Invalid server frame: ${err.message}`, 'protocol_error'), true);
+                    return;
+                }
+                try { this.handleMessage(msg); }
+                catch (err) { this._reportError(err); }
+            }
+            if (Buffer.byteLength(this.messageBuffer) > this.maxFrameBytes) {
+                this._closeConnection(this._error('Incoming frame exceeds maxFrameBytes', 'frame_too_large'), true);
+            }
+        });
+        socket.on('drain', () => {
+            if (this.socket !== socket) return;
+            this._writeBlocked = false;
+            clearTimeout(this._drainTimer);
+            this._drainTimer = null;
+            this._flushWrites();
+        });
+        socket.on('error', err => {
+            if (this.socket === socket) this._closeConnection(err, true);
+        });
+        socket.on('close', () => {
+            if (this.socket === socket) this._closeConnection(this._error('Connection closed', 'connection_lost'));
+        });
+        try { socket.connect(this.port, this.host); }
+        catch (err) { this._closeConnection(err, true); }
+        return promise;
+    }
+
+    _closeConnection(err, report = false) {
+        const socket = this.socket;
+        this.socket = null;
+        this.connected = false;
+        this._ready = false;
+        this._connecting = false;
+        this._switching = false;
+        this._generation++;
+        clearTimeout(this._connectTimer);
+        clearTimeout(this._drainTimer);
+        this._connectTimer = this._drainTimer = null;
+        this._writeBlocked = false;
+        const rejectConnection = this._connectionReject;
+        this._connectionReject = this._connectionPromise = null;
+        this._processes.clear();
+        this._registrations.clear();
+        for (const id of [...this.pending.keys()]) this._settle(id, err);
+        for (const frame of [...this._outbox, ...this._opQueue]) clearTimeout(frame.timer);
+        this._outbox = [];
+        this._opQueue = [];
+        this._queuedBytes = 0;
+        this.messageBuffer = '';
+        rejectConnection?.(err);
+        socket?.destroy();
+        if (socket) this.emit('disconnect');
+        if (report) this._reportError(err);
+    }
+
+    _reportError(err) {
+        if (this.listenerCount('error')) this.emit('error', err);
     }
 
     // ── Message routing ───────────────────────────────────────────────────────
 
     handleMessage(msg) {
         const { type, request_id, payload } = msg;
-        if (request_id && this.pending.has(request_id)) {
-            const entry = this.pending.get(request_id);
-            // Ignore ack for blocking calls — they wait for app_result
-            if (type === 'ack' && (entry.requestType === 'call_process' || entry.requestType === 'call_app')) return;
-            if (type === 'ack' || type === 'error' || type === 'app_result') {
-                this.pending.delete(request_id);
-                if (type === 'error') {
-                    const err = new Error(payload?.message || 'Server error');
-                    err.code = payload?.code || 'server_error';
-                    entry.reject(err);
-                } else {
-                    entry.resolve({ type, payload });
-                }
+        const entry = this.pending.get(request_id);
+        if (entry?.sent && entry.generation === this._generation) {
+            if (['ack', 'error', 'app_result'].includes(type) && entry.deadline <= performance.now()) {
+                this._settle(request_id, this._error(entry.timeoutMessage, 'timeout'));
+                this.handleServerMessage(msg);
+                return;
+            }
+            if (type === 'error') {
+                const err = this._error(payload?.message || 'Server error', payload?.code || 'server_error');
+                err.protocol = true;
+                this._settle(request_id, err);
+                return;
+            }
+            if (type === 'ack') {
+                if (entry.kind === 'result') return;
+                // Legacy self-invocations can share an ID with the callee's delivery ACK.
+                if (entry.kind === 'acceptance' && payload?.delivered && !payload?.queued && !payload?.accepted) return;
+                this._settle(request_id, null, { ...msg });
+                return;
+            }
+            if (type === 'app_result' && entry.kind === 'result') {
+                this._settle(request_id, null, { ...msg });
                 return;
             }
         }
@@ -107,115 +227,400 @@ class LatZeroBaseClient extends EventEmitter {
     }
 
     handleServerMessage(msg) {
+        if (msg.pool != null && msg.pool !== this.poolName) return;
         switch (msg.type) {
             case 'presence_update': this.emit('presence',     msg.payload); break;
             case 'buffer_update':   this.emit('bufferUpdate', msg.payload); break;
             case 'emit_event':      this._dispatchEvent(msg.payload);       break;
             case 'call_app':        this._handleAppCall(msg);               break;
             case 'call_process':    this._handleProcessCall(msg);           break;
+            case 'app_result':      this.emit('app_result', msg);            break;
         }
     }
 
     _dispatchEvent({ event, data }) {
-        (this.eventHandlers.get(event) || []).forEach(h => {
-            try { h(data); } catch (e) { console.error('[LatZero] Event handler error:', e); }
-        });
+        this.emit(event, data);
     }
 
-    async _handleAppCall({ request_id, payload: { event, data } }) {
-        const handlers = this.eventHandlers.get(event) || [];
-        const reply = (value, error = null) => this.sendMessage({
-            type: 'app_result', request_id,
-            client_id: this.clientId, pool: this.poolName,
-            payload: { value, error }
-        });
-        if (!handlers.length) {
-            reply(null, { type: 'NoHandler', message: `No handler for '${event}'` });
-            return;
+    _handleAppCall(msg) { return this._handleCall(msg, msg.payload?.event); }
+
+    _handleProcessCall(msg) { return this._handleCall(msg, msg.payload?.process_id); }
+
+    async _handleCall(msg, event) {
+        const context = { socket: this.socket, generation: this._generation, pool: msg.pool ?? this.poolName };
+        if (!context.socket || !this._contextIsCurrent(context)) return;
+        const prefix = `${this.clientId}:`;
+        const processHandler = typeof event === 'string' && event.startsWith(prefix) ? this._processes.get(event.slice(prefix.length)) : null;
+        // rawListeners preserves EventEmitter's once wrappers and existing on(event, fn) RPC usage.
+        const handler = processHandler || (typeof event === 'string' ? this.rawListeners(event)[0] : null);
+        let payload;
+        if (this._activeHandlers >= this.maxConcurrentHandlers) {
+            payload = { value: null, error: 'Client handler limit reached' };
+        } else if (!handler) {
+            payload = { value: null, error: { type: 'NoHandler', message: `No handler for '${event}'` } };
+        } else {
+            this._activeHandlers++;
+            try {
+                const value = await handler.call(this, msg.payload?.data);
+                try {
+                    // Capture JSON once, so custom toJSON cannot change between validation and reply.
+                    const encoded = JSON.stringify(value === undefined ? null : value);
+                    if (encoded === undefined) throw new TypeError('Only JSON-serializable values are supported');
+                    if (Buffer.byteLength(encoded) > this.maxFrameBytes) throw this._error('Handler result exceeds maxFrameBytes', 'frame_too_large');
+                    payload = { value: JSON.parse(encoded), error: null };
+                } catch (err) {
+                    payload = { value: null, error: this._handlerError(err).message };
+                }
+            } catch (err) {
+                payload = { value: null, error: this._handlerError(err) };
+            } finally {
+                this._activeHandlers--;
+            }
         }
-        try { reply(await Promise.resolve(handlers[0](data))); }
-        catch (e) { reply(null, { type: e.constructor.name, message: e.message }); }
+        if (!this._contextIsCurrent(context)) return;
+        const reply = { type: 'app_result', request_id: msg.request_id, client_id: this.clientId, pool: context.pool, payload };
+        try {
+            let frame;
+            try { frame = this._encode(reply); }
+            catch (err) {
+                reply.payload = { value: null, error: this._handlerError(err).message };
+                frame = this._encode(reply);
+            }
+            this._queueFrame(frame, null, context);
+        } catch (err) {
+            if (this._contextIsCurrent(context)) this._closeConnection(err, true);
+        }
     }
 
-    async _handleProcessCall({ request_id, payload: { process_id, data } }) {
-        const [clientId, processName] = process_id.split(':');
-        const key = `${clientId}:${processName}`;
-        const handlers = this.eventHandlers.get(key) || [];
-        const reply = (value, error = null) => this.sendMessage({
-            type: 'app_result', request_id,
-            client_id: this.clientId, pool: this.poolName,
-            payload: { value, error }
-        });
-        if (!handlers.length) {
-            reply(null, { type: 'NoHandler', message: `No handler for '${processName}'` });
-            return;
-        }
-        try { reply(await Promise.resolve(handlers[0](data))); }
-        catch (e) { reply(null, { type: e.constructor.name, message: e.message }); }
+    _contextIsCurrent(context) {
+        return this._ready && !this._switching && this.socket === context.socket && this._generation === context.generation && this.poolName === context.pool;
     }
 
     // ── Transport ─────────────────────────────────────────────────────────────
 
     sendMessage(msg) {
-        if (!this.connected || !this.socket) throw new Error('Not connected to server');
-        this.socket.write(JSON.stringify(msg) + '\n');
+        if (!this._ready || !this.connected || !this.socket) throw new Error('Not connected to server');
+        if (this._switching) throw this._error('Pool switch in progress', 'pool_switching');
+        this._queueFrame(this._encode(msg), null, { socket: this.socket, generation: this._generation, pool: this.poolName });
     }
 
-    sendRequest(type, payload, pool = null) {
+    sendRequest(type, payload, pool = null, options = {}) {
+        return this._request(type, payload, pool, options, false);
+    }
+
+    _q(type, payload, pool = null, options = {}) {
+        return this._request(type, payload, pool, options, this._queueBeforeReady);
+    }
+
+    _request(type, payload, pool, options, queue) {
         return new Promise((resolve, reject) => {
-            const requestId = this.generateRequestId();
-            this.pending.set(requestId, { resolve, reject, requestType: type });
+            let entry;
             try {
-                this.sendMessage({
-                    type, request_id: requestId,
-                    client_id: this.clientId,
-                    pool: pool !== undefined ? pool : this.poolName,
-                    payload: payload || {}
+                const rpc = type === 'call_app' || type === 'call_process';
+                const wireTimed = rpc || type === 'broadcast_process';
+                if (wireTimed && payload?.timeout != null && (typeof payload.timeout !== 'number' || !Number.isFinite(payload.timeout) || payload.timeout <= 0)) throw new TypeError('Wire timeout must be positive finite seconds');
+                const ms = this._timeoutMs(options.timeout ?? (wireTimed && payload?.timeout != null ? payload.timeout * 1000 : this.timeout));
+                const deadline = options.deadline ?? performance.now() + ms;
+                if (this._switching && !options.allowSwitch && !options.handshake) throw this._error('Pool switch in progress', 'pool_switching');
+                if (!options.handshake && !this._ready && !queue) throw this._error('Not connected to server', 'not_connected');
+                if (options.handshake && !this.connected) throw this._error('Not connected to server', 'not_connected');
+                if (!options.handshake && this._pendingUsers >= this.maxPendingRequests) throw this._error('Outstanding request limit reached', 'client_overloaded');
+                const requestId = this.generateRequestId();
+                const kind = rpc ? (payload?.response_to && payload.response_to !== this.clientId ? 'acceptance' : 'result') : 'ack';
+                entry = {
+                    requestId, requestType: type, kind, resolve, reject, deadline,
+                    generation: this._generation, handshake: !!options.handshake,
+                    onSuccess: options.onSuccess, onFailure: options.onFailure,
+                    timeoutMessage: options.timeoutMessage || (type === 'call_process' ? 'Process call timeout' : type === 'call_app' ? 'Call event timeout' : 'Request timeout'),
+                    sent: false, frame: null, timer: null
+                };
+                const frame = this._encode({
+                    type, request_id: requestId, client_id: this.clientId,
+                    pool: pool !== undefined ? pool : this.poolName, payload: payload || {}
                 });
+                this.pending.set(requestId, entry);
+                if (!entry.handshake) this._pendingUsers++;
+                const remaining = deadline - performance.now();
+                if (remaining <= 0) throw this._error(entry.timeoutMessage, 'timeout');
+                entry.timer = setTimeout(() => this._settle(requestId, this._error(entry.timeoutMessage, 'timeout')), remaining);
+                this._queueFrame(frame, entry);
             } catch (err) {
-                this.pending.delete(requestId);
-                reject(err);
+                if (entry && this.pending.has(entry.requestId)) this._settle(entry.requestId, err);
+                else { options.onFailure?.(err); reject(err); }
+            }
+        });
+    }
+
+    _encode(msg) {
+        const encoded = JSON.stringify(msg);
+        if (encoded === undefined) throw new TypeError('Only JSON-serializable values are supported');
+        const frame = encoded + '\n';
+        if (Buffer.byteLength(frame) > this.maxFrameBytes) throw this._error('Outgoing frame exceeds maxFrameBytes', 'frame_too_large');
+        return frame;
+    }
+
+    _queueFrame(data, entry, context = null) {
+        const bytes = Buffer.byteLength(data);
+        // Two handshake requests have a fixed, bounded reserve so pre-connect work cannot starve joining.
+        const limit = this.maxQueuedBytes + (entry?.handshake ? 16384 : 0);
+        if (this._queuedBytes + (this.socket?.writableLength || 0) + bytes > limit) throw this._error('Transport byte limit reached', 'client_overloaded');
+        const frame = {
+            data, bytes, entry, context, deadline: entry?.deadline ?? performance.now() + this.timeout, timer: null
+        };
+        this._queuedBytes += bytes;
+        if (entry) entry.frame = frame;
+        else frame.timer = setTimeout(() => {
+            if (this._outbox.includes(frame)) this._closeConnection(this._error('Send timeout', 'timeout'), true);
+        }, this.timeout);
+        if (entry && !entry.handshake && !this._ready) this._opQueue.push(frame);
+        else this._outbox.push(frame);
+        this._flushWrites();
+    }
+
+    _flushWrites() {
+        while (this.connected && this.socket && !this._writeBlocked && this._outbox.length) {
+            const frame = this._outbox[0];
+            const entry = frame.entry;
+            if (frame.deadline <= performance.now()) {
+                if (entry) { this._settle(entry.requestId, this._error(entry.timeoutMessage, 'timeout')); continue; }
+                this._closeConnection(this._error('Send timeout', 'timeout'), true);
                 return;
             }
-            setTimeout(() => {
-                if (this.pending.has(requestId)) {
-                    this.pending.delete(requestId);
-                    reject(new Error('Request timeout'));
+            if ((entry && entry.generation !== this._generation) || (frame.context && !this._contextIsCurrent(frame.context))) {
+                if (entry) this._settle(entry.requestId, this._error('Stale request generation', 'connection_lost'));
+                else this._removeFrame(frame);
+                continue;
+            }
+            if (entry && ['call_app', 'call_process', 'broadcast_process'].includes(entry.requestType)) {
+                let data;
+                try {
+                    const msg = JSON.parse(frame.data);
+                    if (!msg.payload || typeof msg.payload !== 'object' || Array.isArray(msg.payload)) throw new TypeError('RPC payload must be a JSON object');
+                    msg.payload.timeout = (entry.deadline - performance.now()) / 1000;
+                    data = this._encode(msg);
                 }
-            }, this.timeout);
+                catch (err) { this._settle(entry.requestId, err); continue; }
+                const bytes = Buffer.byteLength(data);
+                if (this._queuedBytes - frame.bytes + bytes + (this.socket.writableLength || 0) > this.maxQueuedBytes) {
+                    this._settle(entry.requestId, this._error('Transport byte limit reached', 'client_overloaded'));
+                    continue;
+                }
+                this._queuedBytes += bytes - frame.bytes;
+                frame.data = data;
+                frame.bytes = bytes;
+            }
+            if (frame.deadline <= performance.now()) {
+                if (entry) { this._settle(entry.requestId, this._error(entry.timeoutMessage, 'timeout')); continue; }
+                this._closeConnection(this._error('Send timeout', 'timeout'), true);
+                return;
+            }
+            this._removeFrame(frame);
+            if (entry) entry.sent = true;
+            const socket = this.socket;
+            try {
+                // false means accepted by Node, not rejected: never re-write this frame.
+                if (!socket.write(frame.data) && this.socket === socket) {
+                    this._writeBlocked = true;
+                    this._drainTimer = setTimeout(() => {
+                        if (this.socket === socket && this._writeBlocked) this._closeConnection(this._error('Send timeout', 'timeout'), true);
+                    }, Math.max(1, frame.deadline - performance.now()));
+                }
+            } catch (err) {
+                this._closeConnection(err, true);
+                return;
+            }
+        }
+    }
+
+    _removeFrame(frame) {
+        for (const queue of [this._outbox, this._opQueue]) {
+            const idx = queue.indexOf(frame);
+            if (idx !== -1) {
+                queue.splice(idx, 1);
+                this._queuedBytes -= frame.bytes;
+                break;
+            }
+        }
+        clearTimeout(frame.timer);
+        if (frame.entry) frame.entry.frame = null;
+    }
+
+    _settle(requestId, err, result) {
+        const entry = this.pending.get(requestId);
+        if (!entry) return;
+        this.pending.delete(requestId);
+        if (!entry.handshake) this._pendingUsers--;
+        clearTimeout(entry.timer);
+        entry.timer = null;
+        if (entry.frame) this._removeFrame(entry.frame);
+        if (err) {
+            try { entry.onFailure?.(err, entry); }
+            finally { entry.reject(err); }
+        } else {
+            try { entry.onSuccess?.(result); }
+            finally { entry.resolve(result); }
+        }
+    }
+
+    _error(message, code) { return Object.assign(new Error(message), { code }); }
+
+    _handlerError(err) {
+        let type = 'Error';
+        let message = 'Handler failed';
+        try { if (typeof err?.constructor?.name === 'string') type = err.constructor.name; } catch {}
+        try { message = String(err?.message || err); } catch {}
+        return { type, message };
+    }
+
+    _timeoutMs(ms) {
+        if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0 || ms > 2147483647) throw new TypeError('timeout must be positive finite milliseconds (at most 2147483647)');
+        return ms;
+    }
+
+    _ttlSeconds(ms) {
+        if (ms == null) return ms;
+        if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) throw new TypeError('autoClean must be nonnegative finite milliseconds');
+        return ms / 1000;
+    }
+
+    _checkBatch(length) {
+        if (length > this.maxBatchSize || length + this._pendingUsers > this.maxPendingRequests) throw this._error('Batch request limit reached', 'client_overloaded');
+    }
+
+    _registerProcess(fn, nameOverride = null, options = {}) {
+        if (typeof fn !== 'function') throw new TypeError('Process handler must be a function');
+        const name = nameOverride || fn.name;
+        if (!name) throw new Error('Pass an explicit name for anonymous functions.');
+        const min = options.minWorkers ?? 1;
+        const max = options.maxWorkers ?? 10;
+        if (!Number.isSafeInteger(min) || !Number.isSafeInteger(max) || min <= 0 || max < min) throw new TypeError('Worker bounds must be positive integers with minWorkers <= maxWorkers');
+        return this._changeRegistration(name, fn, 'register_process', {
+            process_name: name, worker_kind: options.workerKind || 'thread', min_workers: min, max_workers: max
+        });
+    }
+
+    _changeRegistration(name, fn, type, payload) {
+        const state = { fn, status: 'pending', prior: this._registrations.get(name) };
+        this._registrations.set(name, state);
+        this._applyRegistration(name);
+        return this._q(type, payload, null, {
+            onSuccess: () => {
+                state.status = 'accepted';
+                state.prior = null;
+                this._applyRegistration(name);
+            },
+            onFailure: () => {
+                state.status = 'failed';
+                this._applyRegistration(name);
+            }
+        });
+    }
+
+    _applyRegistration(name) {
+        let state = this._registrations.get(name);
+        while (state?.status === 'failed') state = state.prior;
+        let current = state;
+        while (current?.prior) {
+            if (current.prior.status === 'failed') current.prior = current.prior.prior;
+            else current = current.prior;
+        }
+        if (state && (state.fn || state.status === 'pending')) this._registrations.set(name, state);
+        else this._registrations.delete(name);
+        if (state?.fn) this._processes.set(name, state.fn);
+        else this._processes.delete(name);
+    }
+
+    _makeProcessProxy() {
+        const s = this;
+        return {
+            register(fn, nameOverride = null, options = {}) { return s._registerProcess(fn, nameOverride, options); },
+            unregister(name) { return s._changeRegistration(name, null, 'unregister_process', { process_name: name }); },
+            call(processId, data = {}, options = {}) {
+                const ms = s._timeoutMs(options.timeout ?? s.timeout);
+                const deadline = performance.now() + ms;
+                s.ensureJsonable(data);
+                return s._q('call_process', {
+                    process_id: processId, data, response_to: options.responseTo || null, timeout: ms / 1000
+                }, null, { timeout: ms, deadline });
+            },
+            broadcast(processName, data = {}, options = {}) {
+                const ms = s._timeoutMs(options.timeout ?? s.timeout);
+                const deadline = performance.now() + ms;
+                s.ensureJsonable(data);
+                return s._q('broadcast_process', {
+                    process_name: processName, data, response_to: options.responseTo || null, timeout: ms / 1000
+                }, null, { timeout: ms, deadline }).then(r => r.payload?.invoked_processes || r.payload?.targets || []);
+            },
+            list(pattern = null) { return s._q('list_processes', { pattern }).then(r => r.payload?.processes || {}); }
+        };
+    }
+
+    _callEvent(event, options) {
+        if (!options.targetClientId) throw new Error('callEvent requires targetClientId');
+        const ms = this._timeoutMs(options.timeout ?? this.timeout);
+        const deadline = performance.now() + ms;
+        const data = options.data ?? {};
+        this.ensureJsonable(data);
+        return this._q('call_app', {
+            target_client_id: options.targetClientId, event, data,
+            response_to: options.responseTo || null, timeout: ms / 1000
+        }, null, { timeout: ms, deadline });
+    }
+
+    _switchPool(pool, authToken) {
+        if (this._switching) return Promise.reject(this._error('Pool switch in progress', 'pool_switching'));
+        const token = authToken || this.authToken;
+        if (pool === this.poolName) {
+            return this._q('switch_pool', { client_id: this.clientId, pool, auth_token: token }, null, {
+                onSuccess: () => { this.authToken = token; }
+            });
+        }
+        this._switching = true;
+        const err = this._error('Pool changed; old work was cancelled', 'pool_changed');
+        for (const id of [...this.pending.keys()]) {
+            if (!this.pending.get(id).handshake) this._settle(id, err);
+        }
+        const oldProcesses = this._processes;
+        const oldRegistrations = this._registrations;
+        this._processes = new Map();
+        this._registrations = new Map();
+        this._generation++;
+        for (const entry of this.pending.values()) {
+            if (entry.handshake) entry.generation = this._generation;
+        }
+        for (const frame of [...this._outbox]) {
+            if (!frame.entry) this._removeFrame(frame);
+        }
+        const generation = this._generation;
+        return this._q('switch_pool', { client_id: this.clientId, pool, auth_token: token }, null, {
+            allowSwitch: true,
+            onSuccess: () => {
+                this.poolName = pool;
+                this.authToken = token;
+                this._switching = false;
+            },
+            onFailure: (failure, entry) => {
+                if (this._generation !== generation) return;
+                this._switching = false;
+                this._processes = oldProcesses;
+                this._registrations = oldRegistrations;
+                // A transmitted switch with no definitive ACK leaves membership uncertain.
+                if (!failure.protocol && failure.code === 'timeout' && entry?.sent && this.connected) this._closeConnection(failure);
+            }
         });
     }
 
     generateRequestId() {
-        return 'req_' + Date.now() + '_' + Math.random().toString(36).substr(2, 9);
+        return `req_${Date.now()}_${++this._requestSequence}_${Math.random().toString(36).slice(2, 11)}`;
     }
 
     ensureJsonable(value) {
-        try { JSON.stringify(value); }
+        try { if (JSON.stringify(value) === undefined) throw new TypeError(); }
         catch { throw new TypeError('Only JSON-serializable values are supported'); }
     }
 
-    // ── Event handler registry (separate from EventEmitter internals) ─────────
-
-    on(event, handler) {
-        if (!this.eventHandlers.has(event)) this.eventHandlers.set(event, []);
-        this.eventHandlers.get(event).push(handler);
-        return this;
-    }
-
-    off(event, handler) {
-        if (!this.eventHandlers.has(event)) return this;
-        const list = this.eventHandlers.get(event);
-        const i = list.indexOf(handler);
-        if (i > -1) list.splice(i, 1);
-        if (!list.length) this.eventHandlers.delete(event);
-        return this;
-    }
-
     disconnect() {
-        if (this.connected) this.sendRequest('leave_pool', {}).catch(() => {});
-        if (this.socket) this.socket.end();
-        this.connected = false;
+        this._closeConnection(this._error('Client disconnected', 'disconnected'));
     }
 }
 
@@ -231,10 +636,7 @@ class LatZeroClient extends LatZeroBaseClient {
     constructor(dsn, pool, options = {}) {
         super(dsn, pool, options);
 
-        this._opQueue   = [];   // pending ops while not yet connected
-        this._ready     = false;
-        this._connecting = false;
-
+        this._queueBeforeReady = true;
         this.process = this._makeProcessProxy();
 
         if (options.autoConnect !== false) this._startConnect();
@@ -243,138 +645,30 @@ class LatZeroClient extends LatZeroBaseClient {
     // ── Queue engine ──────────────────────────────────────────────────────────
 
     _startConnect() {
-        if (this._connecting || this._ready) return;
-        this._connecting = true;
-        this._connectSocket()
-            .then(() => {
-                this._ready = true;
-                this._connecting = false;
-                const q = this._opQueue.splice(0);
-                for (const fn of q) { try { fn(); } catch {} }
-            })
-            .catch(err => {
-                this._connecting = false;
-                this.emit('error', err);
-            });
-    }
-
-    /** Run fn immediately if connected, otherwise queue it. */
-    _enqueue(fn) {
-        if (this._ready) fn();
-        else this._opQueue.push(fn);
-    }
-
-    /** Wrap sendRequest so it is deferred until connected. */
-    _q(type, payload, pool = null) {
-        return new Promise((resolve, reject) => {
-            this._enqueue(() => this.sendRequest(type, payload, pool).then(resolve).catch(reject));
-        });
+        return this._connectSocket();
     }
 
     // ── connect() ─ optional callback or Promise ──────────────────────────────
 
     connect(callback) {
-        // if (callback) {
-        //     if (this._ready) { callback(null); return this; }
-        //     this.once('connect', () => callback(null));
-        //     this.once('error',   (e) => callback(e));
-        //     this._startConnect();
-        //     return this;
-        // }
-        if (this._ready) return Promise.resolve();
-
-        return Promise.race([
-            this._startConnect()
-                .then(() => callback?.(null))
-                .catch(e => callback?.(e)),
-            new Promise((resolve, reject) => {
-                this.once('connect', ()=> {
-                    callback?.(null)
-                    resolve();
-                });
-                this.once('error', (e) => {
-                    callback?.(e)
-                    reject(e);
-                });
-            })
-        ])
-    }
-
-    // ── process.* proxy ───────────────────────────────────────────────────────
-
-    _makeProcessProxy() {
-        const s = this;
-        return {
-            register(fn, nameOverride = null, options = {}) {
-                const name = nameOverride || fn.name;
-                if (!name) throw new Error('Pass an explicit name for anonymous functions.');
-                const key = `${s.clientId}:${name}`;
-                if (!s.eventHandlers.has(key)) s.eventHandlers.set(key, []);
-                s.eventHandlers.get(key).push(fn);
-                s._processes.set(name, fn);
-                return s._q('register_process', {
-                    process_name: name,
-                    worker_kind: options.workerKind || "thread",
-                    min_workers: options.minWorkers || 1,
-                    max_workers: options.maxWorkers || 10,
-                });
-            },
-            unregister(name) {
-                s.eventHandlers.delete(`${s.clientId}:${name}`);
-                s._processes.delete(name);
-                return s._q('unregister_process', { process_name: name });
-            },
-            call(processId, data = {}, options = {}) {
-                s.ensureJsonable(data);
-                const ms = options.timeout || s.timeout;
-                if (options.responseTo) {
-                    return s._q('call_process', {
-                        process_id: processId, data,
-                        response_to: options.responseTo, timeout: ms / 1000
-                    });
-                }
-                return new Promise((resolve, reject) => {
-                    s._enqueue(() => {
-                        const reqId = s.generateRequestId();
-                        s.pending.set(reqId, { resolve, reject, requestType: 'call_process' });
-                        try {
-                            s.sendMessage({
-                                type: 'call_process', request_id: reqId,
-                                client_id: s.clientId, pool: s.poolName,
-                                payload: { process_id: processId, data, timeout: ms / 1000 }
-                            });
-                        } catch (e) { s.pending.delete(reqId); reject(e); return; }
-                        setTimeout(() => {
-                            if (s.pending.has(reqId)) { s.pending.delete(reqId); reject(new Error('Process call timeout')); }
-                        }, ms);
-                    });
-                });
-            },
-            broadcast(processName, data = {}, options = {}) {
-                s.ensureJsonable(data);
-                return s._q('broadcast_process', {
-                    process_name: processName, data,
-                    response_to: options.responseTo || null,
-                    timeout: (options.timeout || s.timeout) / 1000
-                }).then(r => r.payload?.invoked_processes || []);
-            },
-            list(pattern = null) {
-                return s._q('list_processes', { pattern }).then(r => r.payload?.processes || {});
-            }
-        };
+        const promise = this._startConnect();
+        if (!callback) return promise;
+        const callbackPromise = promise.then(() => { callback(null); }, err => { callback(err); throw err; });
+        callbackPromise.catch(() => {});
+        return callbackPromise;
     }
 
     // ── Buffer ops ────────────────────────────────────────────────────────────
 
     set(key, value, options = {}) {
         this.ensureJsonable(value);
-        return this._q('set_buffer', { key, value, ttl: options.autoClean, persistent: options.persistent || false });
+        return this._q('set_buffer', { key, value, ttl: this._ttlSeconds(options.autoClean), persistent: options.persistent || false });
     }
 
     get(key, defaultValue = null) {
         return this._q('get_buffer', { key }).then(r => {
             const p = r.payload || {};
-            return p.exists ? (p.entry?.value ?? defaultValue) : defaultValue;
+            return p.exists && p.entry != null ? p.entry.value : defaultValue;
         });
     }
 
@@ -395,18 +689,23 @@ class LatZeroClient extends LatZeroBaseClient {
     }
 
     values(pattern = null) {
-        return this.keys(pattern).then(ks => Promise.all(ks.map(k => this.get(k))));
+        return this.keys(pattern).then(ks => { this._checkBatch(ks.length); return Promise.all(ks.map(k => this.get(k))); });
     }
 
     items(pattern = null) {
-        return this.keys(pattern).then(ks => Promise.all(ks.map(async k => [k, await this.get(k)])));
+        return this.keys(pattern).then(ks => { this._checkBatch(ks.length); return Promise.all(ks.map(async k => [k, await this.get(k)])); });
     }
 
     mset(data, options = {}) {
-        return Promise.all(Object.entries(data).map(([k, v]) => this.set(k, v, options))).then(() => {});
+        const entries = Object.entries(data);
+        this._checkBatch(entries.length);
+        for (const [, value] of entries) this.ensureJsonable(value);
+        this._ttlSeconds(options.autoClean);
+        return Promise.all(entries.map(([k, v]) => this.set(k, v, options))).then(() => {});
     }
 
     mget(keys) {
+        this._checkBatch(keys.length);
         return Promise.all(keys.map(k => this.get(k))).then(vals => {
             const out = {};
             keys.forEach((k, i) => out[k] = vals[i]);
@@ -415,6 +714,7 @@ class LatZeroClient extends LatZeroBaseClient {
     }
 
     deleteMany(keys) {
+        this._checkBatch(keys.length);
         return Promise.all(keys.map(k => this.delete(k))).then(rs => rs.filter(Boolean).length);
     }
 
@@ -447,33 +747,11 @@ class LatZeroClient extends LatZeroBaseClient {
     }
 
     callEvent(event, options = {}) {
-        if (!options.targetClientId) throw new Error('callEvent requires targetClientId');
-        const ms = options.timeout || this.timeout;
-        return new Promise((resolve, reject) => {
-            this._enqueue(() => {
-                const reqId = this.generateRequestId();
-                this.pending.set(reqId, { resolve, reject, requestType: 'call_app' });
-                try {
-                    this.sendMessage({
-                        type: 'call_app', request_id: reqId,
-                        client_id: this.clientId, pool: this.poolName,
-                        payload: {
-                            target_client_id: options.targetClientId,
-                            event, data: options.data || {}, timeout: ms / 1000
-                        }
-                    });
-                } catch (e) { this.pending.delete(reqId); reject(e); return; }
-                setTimeout(() => {
-                    if (this.pending.has(reqId)) { this.pending.delete(reqId); reject(new Error('Call event timeout')); }
-                }, ms);
-            });
-        });
+        return this._callEvent(event, options);
     }
 
     switchPool(pool, authToken = null) {
-        return this._q('switch_pool', {
-            client_id: this.clientId, pool, auth_token: authToken || this.authToken
-        }).then(() => { this.poolName = pool; this.authToken = authToken; });
+        return this._switchPool(pool, authToken).then(() => {});
     }
 }
 
@@ -485,64 +763,13 @@ class LatZeroAsyncClient extends LatZeroBaseClient {
     constructor(dsn, pool, options = {}) {
         super(dsn, pool, options);
 
-        const s = this;
+        const process = this._makeProcessProxy();
         this.process = {
-            async register(fn, nameOverride = null, options = {}) {
-                const name = nameOverride || fn.name;
-                if (!name) throw new Error('Pass an explicit name for anonymous functions.');
-                const key = `${s.clientId}:${name}`;
-                if (!s.eventHandlers.has(key)) s.eventHandlers.set(key, []);
-                s.eventHandlers.get(key).push(fn);
-                s._processes.set(name, fn);
-                await s.sendRequest('register_process', {
-                    process_name: name,
-                    worker_kind: options.workerKind || "thread",
-                    min_workers: options.minWorkers || 1,
-                    max_workers: options.maxWorkers || 10,
-                });
-            },
-            async unregister(name) {
-                s.eventHandlers.delete(`${s.clientId}:${name}`);
-                s._processes.delete(name);
-                await s.sendRequest('unregister_process', { process_name: name });
-            },
-            async call(processId, data = {}, options = {}) {
-                s.ensureJsonable(data);
-                const ms = options.timeout || s.timeout;
-                if (options.responseTo) {
-                    return s.sendRequest('call_process', {
-                        process_id: processId, data,
-                        response_to: options.responseTo, timeout: ms / 1000
-                    });
-                }
-                const reqId = s.generateRequestId();
-                return new Promise((resolve, reject) => {
-                    s.pending.set(reqId, { resolve, reject, requestType: 'call_process' });
-                    try {
-                        s.sendMessage({
-                            type: 'call_process', request_id: reqId,
-                            client_id: s.clientId, pool: s.poolName,
-                            payload: { process_id: processId, data, timeout: ms / 1000 }
-                        });
-                    } catch (e) { s.pending.delete(reqId); reject(e); return; }
-                    setTimeout(() => {
-                        if (s.pending.has(reqId)) { s.pending.delete(reqId); reject(new Error('Process call timeout')); }
-                    }, ms);
-                });
-            },
-            async broadcast(processName, data = {}, options = {}) {
-                s.ensureJsonable(data);
-                const r = await s.sendRequest('broadcast_process', {
-                    process_name: processName, data,
-                    response_to: options.responseTo || null,
-                    timeout: (options.timeout || s.timeout) / 1000
-                });
-                return r.payload?.invoked_processes || [];
-            },
-            async list(pattern = null) {
-                const r = await s.sendRequest('list_processes', { pattern });
-                return r.payload?.processes || {};
-            }
+            async register(...args) { await process.register(...args); },
+            async unregister(...args) { await process.unregister(...args); },
+            async call(...args) { return process.call(...args); },
+            async broadcast(...args) { return process.broadcast(...args); },
+            async list(...args) { return process.list(...args); }
         };
 
         if (options.autoConnect !== false) this.connect();
@@ -552,13 +779,13 @@ class LatZeroAsyncClient extends LatZeroBaseClient {
 
     async set(key, value, options = {}) {
         this.ensureJsonable(value);
-        await this.sendRequest('set_buffer', { key, value, ttl: options.autoClean, persistent: options.persistent || false });
+        await this.sendRequest('set_buffer', { key, value, ttl: this._ttlSeconds(options.autoClean), persistent: options.persistent || false });
     }
 
     async get(key, defaultValue = null) {
         const r = await this.sendRequest('get_buffer', { key });
         const p = r.payload || {};
-        return p.exists ? (p.entry?.value ?? defaultValue) : defaultValue;
+        return p.exists && p.entry != null ? p.entry.value : defaultValue;
     }
 
     async delete(key) {
@@ -582,18 +809,27 @@ class LatZeroAsyncClient extends LatZeroBaseClient {
     }
 
     async values(pattern = null) {
-        return Promise.all((await this.keys(pattern)).map(k => this.get(k)));
+        const keys = await this.keys(pattern);
+        this._checkBatch(keys.length);
+        return Promise.all(keys.map(k => this.get(k)));
     }
 
     async items(pattern = null) {
-        return Promise.all((await this.keys(pattern)).map(async k => [k, await this.get(k)]));
+        const keys = await this.keys(pattern);
+        this._checkBatch(keys.length);
+        return Promise.all(keys.map(async k => [k, await this.get(k)]));
     }
 
     async mset(data, options = {}) {
-        await Promise.all(Object.entries(data).map(([k, v]) => this.set(k, v, options)));
+        const entries = Object.entries(data);
+        this._checkBatch(entries.length);
+        for (const [, value] of entries) this.ensureJsonable(value);
+        this._ttlSeconds(options.autoClean);
+        await Promise.all(entries.map(([k, v]) => this.set(k, v, options)));
     }
 
     async mget(keys) {
+        this._checkBatch(keys.length);
         const vals = await Promise.all(keys.map(k => this.get(k)));
         const out = {};
         keys.forEach((k, i) => out[k] = vals[i]);
@@ -601,6 +837,7 @@ class LatZeroAsyncClient extends LatZeroBaseClient {
     }
 
     async deleteMany(keys) {
+        this._checkBatch(keys.length);
         return (await Promise.all(keys.map(k => this.delete(k)))).filter(Boolean).length;
     }
 
@@ -629,33 +866,11 @@ class LatZeroAsyncClient extends LatZeroBaseClient {
     }
 
     async callEvent(event, options = {}) {
-        if (!options.targetClientId) throw new Error('callEvent requires targetClientId');
-        const ms = options.timeout || this.timeout;
-        const reqId = this.generateRequestId();
-        return new Promise((resolve, reject) => {
-            this.pending.set(reqId, { resolve, reject, requestType: 'call_app' });
-            try {
-                this.sendMessage({
-                    type: 'call_app', request_id: reqId,
-                    client_id: this.clientId, pool: this.poolName,
-                    payload: {
-                        target_client_id: options.targetClientId,
-                        event, data: options.data || {}, timeout: ms / 1000
-                    }
-                });
-            } catch (e) { this.pending.delete(reqId); reject(e); return; }
-            setTimeout(() => {
-                if (this.pending.has(reqId)) { this.pending.delete(reqId); reject(new Error('Call event timeout')); }
-            }, ms);
-        });
+        return this._callEvent(event, options);
     }
 
     async switchPool(pool, authToken = null) {
-        await this.sendRequest('switch_pool', {
-            client_id: this.clientId, pool, auth_token: authToken || this.authToken
-        });
-        this.poolName = pool;
-        this.authToken = authToken;
+        await this._switchPool(pool, authToken);
     }
 }
 
