@@ -171,7 +171,34 @@ CommonJS is also supported: `const LatZeroClient = require('latzero')` and
 - No automatic replay, effectful retry, or worker threads are introduced. A timed-out transmitted request may still have executed. JavaScript handlers run on the Node event loop, and already-running user code cannot be forcibly cancelled.
 - Application replies retain `{ value, error }` inside `response.payload`; application errors resolve as raw replies, while protocol/transport failures reject. Thrown handler errors retain their type/message object; unserializable or oversized results become `{ value: null, error: '<message>' }`.
 
-Run `npm test` for the Node built-in suite covering ESM and CommonJS, both client classes, deterministic socket faults, and temporary-port raw TCP routing. It does not require a running daemon or use the default port/cache.
+Run `npm test` for the Node built-in suite covering ESM and CommonJS, both client classes, deterministic socket faults, temporary-port raw TCP routing, and local router/owner redirect fixtures. It does not require a running daemon or use the default port/cache.
+
+### Local Pod Mode (1.2.0)
+
+Pod mode is enabled explicitly on the server with `--pods N`, not by this SDK. It assigns each entire pool to one local pod; it does not divide one pool across pods or proxy RPCs between pools. Use Node SDK **1.2.0 or newer** with pod mode. Older SDKs receive the correlated server error `redirect_required` at a wrong owner instead of silently waiting for an ACK. This release remains compatible with classic servers that return ordinary hello/join/switch ACKs.
+
+```bash
+latzero-server --pods 4 --host 127.0.0.1 --port 14130
+```
+
+```js
+const client = new LatZeroClient('latzero://pod-worker', 'jobs', {
+    host: '127.0.0.1', port: 14130, autoConnect: false,
+    allowRedirects: true, maxRedirects: 4
+});
+await client.connect();
+await client.process.register(data => data, 'echo');
+console.log(client.host, client.port); // Stable configured entry
+console.log(client.endpoint);         // Actual current TCP endpoint
+```
+
+- Every hello advertises `payload.capabilities: ['pool_redirect_v1']`. Only a sent, correlated `join_pool` or `switch_pool` request can accept a `redirect`. Hello, application RPCs, results, and control operations never redirect or replay.
+- Redirects default to at most four hops under the original connect/switch timeout, including TCP setup, hello, join, and every hop. `connected`, the connection Promise, and the `connect` event indicate readiness only after the final owner's join ACK. Concurrent `connect()` calls share one Promise across those hops.
+- The configured entry host must be numeric loopback or `localhost`; owner and router metadata hosts must be numeric loopback. Ports, both pool fields, client identity, protocol, cluster/count metadata, pod range, repeated endpoints/pods, and the hop limit are validated. No DNS target, URL, remote-to-loopback trust, router fallback, or general-purpose redirect is supported. Local processes are still a trust boundary; this is not authenticated pod discovery.
+- `client.host` and `client.port` remain the configured stable entry. `client.endpoint` is a read-only frozen `{ host, port }` for the actual transport, or `null` after disconnect. A later explicit `connect()` starts at the configured entry, not the last pod or reply-supplied router metadata.
+- Transport replacement rejects remaining operations with `connection_replaced`, including unsent startup operations, drops queued replies, clears process registrations, and fences in-progress replies. For pod mode, await `connect()` before writes or registration, even with the queue-first client. Nothing is automatically retried or re-registered.
+- A switch to a different owner pauses handler admission, cancels old-pool routes, and rejoins with the same client ID and supplied auth under the original switch deadline. It emits `disconnect` for the retired ready owner and `connect` after the new owner accepts. Lifecycle/user listeners remain installed, and old-socket EOF cannot invalidate the new connection. Same-pool ACKs retain registrations and pending routes; a same-pool transport replacement cannot retain them.
+- `allowRedirects: false` or `maxRedirects: 0` disables following and rejects a redirect with `redirect_required`. Owner authentication errors propagate without retry. Intentional close and unexpected EOF do not automatically reconnect. Already-running JavaScript cannot be forcibly stopped, but its old reply is fenced and the SDK does not rerun it.
 
 Make sure a LatZero server is running:
 ```bash
@@ -241,8 +268,8 @@ new LatZeroAsyncClient(dsn, pool, options?)
 |---|---|---|---|
 | `dsn` | string | — | Client DSN: `latzero://your-client-id` |
 | `pool` | string | — | Pool name to join |
-| `options.host` | string | `'127.0.0.1'` | Server hostname |
-| `options.port` | number | `14130` | Server TCP port |
+| `options.host` | string | `'127.0.0.1'` | Stable entry hostname; pod redirects require loopback or `localhost` |
+| `options.port` | number | `14130` | Stable entry TCP port, unchanged by redirects |
 | `options.timeout` | number | `5000` | End-to-end request/connect timeout (ms), positive finite, at most `2147483647` |
 | `options.authToken` | string | `null` | Optional pool auth token |
 | `options.autoConnect` | boolean | `true` | Connect on construction |
@@ -251,8 +278,10 @@ new LatZeroAsyncClient(dsn, pool, options?)
 | `options.maxFrameBytes` | integer | `1048576` | Maximum encoded outgoing/incoming NDJSON frame bytes |
 | `options.maxBatchSize` | integer | `256` | Maximum entries in `mset`, `mget`, `deleteMany`, `values`, or `items` |
 | `options.maxConcurrentHandlers` | integer | `64` | Active async RPC handlers, including fenced work still finishing |
+| `options.maxRedirects` | integer | `4` | Maximum local membership redirect hops, from `0` (disabled) to `16` |
+| `options.allowRedirects` | boolean | `true` | Permit validated local pool-owner redirects |
 
-Limits must be positive integers and are protective defaults, not throughput guarantees. Hello/join use a fixed 16 KiB transport reserve and one internal pending slot so pre-connect user requests cannot starve the handshake. Batch operations are not atomic; transmitted entries may have effects even if another entry is rejected.
+Request/byte/batch/handler limits must be positive integers and are protective defaults, not throughput guarantees. `maxRedirects` instead accepts `0..16`. Hello/join use a fixed 16 KiB transport reserve and one internal pending slot so pre-connect user requests cannot starve the handshake. Batch operations are not atomic; transmitted entries may have effects even if another entry is rejected.
 
 #### `connect(callback?)` — LatZeroClient only
 
@@ -290,6 +319,8 @@ client.switchPool('new-pool');
 // Async:
 await client.switchPool('new-pool', 'auth-token');
 ```
+
+The Promise includes any required owner hello/join and shares one switch timeout. Different-pool switches cancel old work with `pool_changed`; transport replacement additionally rejects remaining work with `connection_replaced`. Register processes and subscriptions explicitly after success. A definitive same-owner rejection restores prior process registrations, but a retired connection or owner auth denial cannot restore them. Same-pool ACK rejoin retains existing callbacks and routes.
 
 ---
 
@@ -646,6 +677,8 @@ client.on('error', (err) => {
 | `callEvent requires targetClientId` | Forgot `targetClientId` option on `callEvent` |
 
 Limit rejections use `err.code === 'client_overloaded'`; oversized frames use `frame_too_large`, and local deadlines use `timeout`. Connection failures reject pending operations and are emitted to registered `error` listeners once. A missing `error` listener does not hide the Promise rejection; explicit `client.emit('error', err)` retains Node's normal unhandled-error behavior.
+
+Pod redirect failures use `redirect_required` (disabled following or older-SDK server error), `invalid_redirect` (malformed or inconsistent membership metadata), `unsafe_redirect` (entry/target trust violation), `redirect_loop`, or `redirect_limit`. `connection_replaced` means remaining transport-bound work was cancelled, not replayed; transmitted effects may already have executed.
 
 ---
 

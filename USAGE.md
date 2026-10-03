@@ -17,26 +17,45 @@ The LatZero Node.js Client is a comprehensive client library that provides both 
 
 ### Setup
 
-1. Copy the fixed client file to your project:
+Install the package:
 ```bash
-cp index-fixed.js latzero-client.js
-```
-
-2. Install dependencies (if using package.json):
-```bash
-npm install
+npm install latzero
 ```
 
 ### Basic Setup
 
 ```javascript
-import LatZeroClient from './latzero-client.js';
+import LatZeroClient from 'latzero';
 ```
+
+CommonJS uses `const LatZeroClient = require('latzero')`; both formats also export `LatZeroAsyncClient`.
+
+### Local Pod Mode (1.2.0)
+
+Enable server pool affinity explicitly with `latzero-server --pods N` on loopback. Pod mode requires Node SDK **1.2.0+**; older clients at a wrong owner get `redirect_required` rather than a silent join timeout. Classic servers remain compatible and use normal ACKs.
+
+```javascript
+const client = new LatZeroClient('latzero://pod-worker', 'jobs', {
+    host: '127.0.0.1', port: 14130, autoConnect: false,
+    maxRedirects: 4, allowRedirects: true
+});
+await client.connect();
+await client.process.register(data => data, 'echo');
+console.log(client.endpoint); // Actual owner TCP endpoint
+```
+
+Only sent/correlated join or switch responses can redirect after hello ACK. The SDK advertises `hello.payload.capabilities: ['pool_redirect_v1']`; it follows at most four hops by default within one original timeout. The configured entry must be loopback or `localhost` and reply hosts must be numeric loopback. It validates identity, both pool fields, protocol, all TCP/WS ports, pod range, stable cluster metadata, cycles, and the hop limit. It never follows application/control redirects, trusts a remote entry to reach loopback, uses reply URLs/DNS targets, or retries RPCs.
+
+`client.host` / `client.port` stay configured to the stable entry. Read-only `client.endpoint` is the frozen actual `{ host, port }` or `null`. `connected`, `connect` events, and the shared connection Promise indicate only final-owner join readiness. Explicit reconnect starts at the entry; there is no automatic reconnect or router fallback.
+
+Transport replacement rejects remaining operations (including unsent startup operations) with `connection_replaced`, clears registrations, and drops old replies without replay. Await connection before writes/registration in pod mode, including with the queue-first client. Re-register and re-subscribe only explicitly after an owner-changing switch. Running handlers are not rerun or forcibly cancelled, but their old socket/pool replies are fenced. Same-pool ACK rejoin retains callbacks/routes unless the transport itself changes.
+
+`maxRedirects` accepts integers `0..16` (default `4`); `0` or `allowRedirects: false` rejects redirects with `redirect_required`. Other redirect failures use `invalid_redirect`, `unsafe_redirect`, `redirect_loop`, or `redirect_limit`. Final-owner auth denial propagates without retry. This local protocol is not general remote service discovery or an SSRF-compatible redirect mechanism.
 
 ## Quick Start
 
 ```javascript
-import LatZeroClient from './index-fixed.js';
+import LatZeroClient from 'latzero';
 
 // Create client instance
 const client = new LatZeroClient('latzero://my-node-client', 'my-pool', {
@@ -70,11 +89,13 @@ new LatZeroClient(dsn, pool, options)
 **Parameters:**
 - `dsn` (string): Client DSN in format `latzero://client-id`
 - `pool` (string): Pool name to join
-- `options` (object): Optional configuration
-  - `host` (string): Server host (default: '127.0.0.1')
-  - `port` (number): Server port (default: 14130)
-  - `timeout` (number): Request timeout in ms (default: 5000)
-  - `autoConnect` (boolean): Auto-connect on creation (default: true)
+- `options.host` (string): Stable entry host (default: '127.0.0.1')
+- `options.port` (number): Stable entry TCP port (default: 14130)
+- `options.timeout` (number): End-to-end request/connect/switch timeout in ms (default: 5000)
+- `options.autoConnect` (boolean): Auto-connect on creation (default: true)
+- `options.authToken` (string): Optional pool auth token
+- `options.maxRedirects` (integer): Local membership redirect hops, `0..16` (default: 4)
+- `options.allowRedirects` (boolean): Follow validated local owner redirects (default: true)
 
 ### Buffer Operations
 
@@ -333,6 +354,8 @@ Switch to a different pool.
 ```javascript
 await client.switchPool('new-pool', 'auth-token');
 ```
+
+An owner-changing switch rejoins with the same client ID and supplied auth under the original switch deadline. Old work is cancelled, replies fenced, and registrations cleared; await success before explicitly registering in the new pool. Existing lifecycle/user listeners remain installed: replacing a ready owner emits `disconnect`, then `connect` after the final owner's ACK. Intentional close never triggers automatic reconnect. Same-pool ACKs retain registrations and pending routes; an actual socket replacement rejects those remaining routes with `connection_replaced`.
 
 ## Cross-Process Communication
 
@@ -808,9 +831,11 @@ async function testCrossProcessCommunication() {
 ### Integration Testing
 
 ```javascript
-// test-fixed.js provides comprehensive integration testing
-// Run with: node test-fixed.js
+// npm test runs test.js and redirect.test.js with Node's built-in runner.
+// ESM/CJS and both APIs use deterministic faults and ephemeral TCP fixtures.
 ```
+
+Run `npm test` without a daemon. Router/owner fixtures use `net.listen(0)`, explicit frame barriers and controlled timeout clocks, not default ports, cache directories, or arbitrary sleeps. The tests cover bounded redirects, unsafe metadata rejection, shared budgets, switch/EOF/reply fencing, explicit reconnect, auth denial, old-server ACK compatibility, and unchanged ACK/result envelopes.
 
 ## Troubleshooting
 
