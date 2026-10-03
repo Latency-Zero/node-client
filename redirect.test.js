@@ -211,6 +211,7 @@ for (const [label, Client, queued] of variants) {
         assert.equal(ownerJoin.msg.pool, null);
         ownerJoin.peer.ack(ownerJoin.msg);
         await Promise.all([connection, callback]);
+        assert.equal(await connection, undefined);
         assert.equal(client.connected, true);
         assert.equal(client._ready, true);
         assert.equal(callbacks, queued ? 1 : 0);
@@ -294,6 +295,7 @@ for (const [label, Client, queued] of variants) {
         joined.peer.socket.write(JSON.stringify({ type: 'ack', request_id: joined.msg.request_id, pool: null, payload: { joined: true } }) + '\n' +
             JSON.stringify({ type: 'presence_update', pool: 'pool-b', payload: 'new-owner' }) + '\n');
         await Promise.all([switching, ownerConnection, cancelled]);
+        assert.equal(await ownerConnection, undefined);
         assert.equal(client.poolName, 'pool-b');
         assert.equal(client.authToken, 'new-token');
         assert.equal(client.connected, true);
